@@ -15,9 +15,6 @@ only for 2D spatial data which are straightforward to generalize to cases of
 higher and lower dimensions. Variable names follow the standard
 @ref dev_guide_conventions.
 
-@note Mathematical operation commonly called "convolution" in the context of deep
-learning workloads is actually cross-correlation.
-
 Let \src, \weights and \dst be \f$N \times IC \times IH \times
 IW\f$, \f$OC \times IC \times KH \times KW\f$, and \f$N \times OC \times OH
 \times OW\f$ tensors respectively. Let \bias be a 1D tensor with \f$OC\f$
@@ -131,7 +128,7 @@ When executed, the inputs and outputs should be mapped to an execution
 argument index as specified by the following table.
 
 | Primitive input/output      | Execution argument index                                                  |
-|-----------------------------|---------------------------------------------------------------------------|
+| ---                         | ---                                                                       |
 | \src                        | DNNL_ARG_SRC                                                              |
 | \weights                    | DNNL_ARG_WEIGHTS                                                          |
 | \bias                       | DNNL_ARG_BIAS                                                             |
@@ -154,19 +151,19 @@ N/A.
 Convolution primitive supports the following combination of data types for
 source, destination, and weights memory objects:
 
-| Propagation    | Source    | Weights   | Destination                 | Bias                        |
-|:---------------|:----------|:----------|:----------------------------|:----------------------------|
-| forward        | f32       | f32       | f32, u8, s8                 | f32                         |
-| forward        | f16       | f16       | f16, f32, u8, s8            | f16, f32                    |
-| forward        | u8, s8    | s8        | u8, s8, s32, f32, f16, bf16 | u8, s8, s32, f32, f16, bf16 |
-| forward        | bf16      | bf16      | f32, bf16                   | f32, bf16                   |
-| forward        | f64       | f64       | f64                         | f64                         |
-| backward       | f32, bf16 | bf16      | bf16                        |                             |
-| backward       | f32, f16  | f16       | f16                         |                             |
-| backward       | f32       | f32       | f32                         | f32                         |
-| backward       | f64       | f64       | f64                         | f64                         |
-| weights update | bf16      | f32, bf16 | bf16, s8, u8                | f32, bf16                   |
-| weights update | f16       | f32, f16  | f16                         | f32, f16                    |
+| Propagation        | Source    | Weights   | Destination                  | Bias                        |
+| :--                | :--       | :--       | :--                          | :--                         |
+| forward            | f32       | f32       | f32, u8, s8                  | f32                         |
+| forward            | f16       | f16       | f16, f32, u8, s8             | f16, f32                    |
+| forward            | u8, s8    | s8        | u8, s8, s32, f32, f16, bf16  | u8, s8, s32, f32, f16, bf16 |
+| forward            | bf16      | bf16      | f32, bf16                    | f32, bf16                   |
+| forward            | f64       | f64       | f64                          | f64                         |
+| backward           | f32, bf16 | bf16      | bf16                         |                             |
+| backward           | f32, f16  | f16       | f16                          |                             |
+| backward           | f32       | f32       | f32                          | f32                         |
+| backward           | f64       | f64       | f64                          | f64                         |
+| weights update     | bf16      | f32, bf16 | bf16, s8, u8                 | f32, bf16                   |
+| weights update     | f16       | f32, f16  | f16                          | f32, f16                    |
 
 @warning
     There might be hardware and/or implementation specific restrictions.
@@ -177,11 +174,11 @@ source, destination, and weights memory objects:
 Like other CNN primitives, the convolution primitive expects the following
 tensors:
 
-| Spatial | Source / Destination                        | Weights                                                      |
-|:--------|:--------------------------------------------|:-------------------------------------------------------------|
-| 1D      | \f$N \times C \times W\f$                   | \f$[G \times ] OC \times IC \times KW\f$                     |
-| 2D      | \f$N \times C \times H \times W\f$          | \f$[G \times ] OC \times IC \times KH \times KW\f$           |
-| 3D      | \f$N \times C \times D \times H \times W\f$ | \f$[G \times ] OC \times IC \times KD \times KH \times KW\f$ |
+| Spatial | Source / Destination                        | Weights
+| :--     | :--                                         | :--
+| 1D      | \f$N \times C \times W\f$                   | \f$[G \times ] OC \times IC \times KW\f$
+| 2D      | \f$N \times C \times H \times W\f$          | \f$[G \times ] OC \times IC \times KH \times KW\f$
+| 3D      | \f$N \times C \times D \times H \times W\f$ | \f$[G \times ] OC \times IC \times KD \times KH \times KW\f$
 
 Physical format of data and weights memory objects is critical for convolution
 primitive performance. In the oneDNN programming model, convolution is
@@ -193,15 +190,23 @@ descriptor and then query it for the actual data and weight memory objects
 formats.
 
 While convolution primitives can be created with memory formats specified
-explicitly, the performance may be suboptimal. The table below shows
-the combinations of memory formats the convolution primitive is optimized for.
+explicitly, the performance is likely to be suboptimal.
 
-| Source / Destination               | Weights                            | Limitations                                |
-|:-----------------------------------|:-----------------------------------|:-------------------------------------------|
-| `any`                              | `any`                              | N/A                                        |
-| #dnnl_nwc, #dnnl_nhwc, #dnnl_ndhwc | `any`                              | N/A                                        |
-| #dnnl_nwc, #dnnl_nhwc, #dnnl_ndhwc | #dnnl_wio, #dnnl_hwio, #dnnl_dhwio | Only on GPUs with Xe-HPC architecture only |
-| #dnnl_ncw, #dnnl_nchw, #dnnl_ncdhw | `any`                              | Only on CPU                                |
+The table below shows the combinations for which **plain** memory formats
+the convolution primitive is optimized for.
+
+| Spatial    | Convolution Type | Data / Weights logical tensor | Implementation optimized for memory formats
+| :--        | :--              | :--                           | :--
+| 1D, 2D, 3D |                  | `any`                         | *optimized*
+| 1D         | f32, bf16        | NCW / OIW, GOIW               | #dnnl_ncw (#dnnl_abc) / #dnnl_oiw (#dnnl_abc), #dnnl_goiw (#dnnl_abcd)
+| 1D         | \"               | \"                            | #dnnl_nwc (#dnnl_acb) / #dnnl_wio (#dnnl_cba), #dnnl_wigo (#dnnl_dcab)
+| 1D         | int8             | NCW / OIW                     | #dnnl_nwc (#dnnl_acb) / #dnnl_wio (#dnnl_cba)
+| 2D         | f32, bf16        | NCHW / OIHW, GOIHW            | #dnnl_nchw (#dnnl_abcd) / #dnnl_oihw (#dnnl_abcd), #dnnl_goihw (#dnnl_abcde)
+| 2D         | \"               | \"                            | #dnnl_nhwc (#dnnl_acdb) / #dnnl_hwio (#dnnl_cdba), #dnnl_hwigo (#dnnl_decab)
+| 2D         | int8             | NCHW / OIHW, GOIHW            | #dnnl_nhwc (#dnnl_acdb) / #dnnl_hwio (#dnnl_cdba), #dnnl_hwigo (#dnnl_decab)
+| 3D         | f32, bf16        | NCDHW / OIDHW, GOIDHW         | #dnnl_ncdhw (#dnnl_abcde) / #dnnl_oidhw (#dnnl_abcde), #dnnl_goidhw (#dnnl_abcdef)
+| 3D         | \"               | \"                            | #dnnl_ndhwc (#dnnl_acdeb) / #dnnl_dhwio (#dnnl_cdeba), #dnnl_dhwigo (#dnnl_defcab)
+| 3D         | int8             | NCDHW / OIDHW                 | #dnnl_ndhwc (#dnnl_acdeb) / #dnnl_dhwio (#dnnl_cdeba)
 
 ### Post-ops and Attributes
 
@@ -210,14 +215,14 @@ primitive by applying the output scale to the result of the primitive and by
 chaining certain operations after the primitive. The following attributes and
 post-ops are supported:
 
-| Propagation | Type      | Operation                                                      | Description                                                                   | Restrictions                                                           |
-|:------------|:----------|:---------------------------------------------------------------|:------------------------------------------------------------------------------|:-----------------------------------------------------------------------|
-| forward     | attribute | [Scale](@ref dnnl::primitive_attr::set_scales_mask)            | Scales the result of convolution by given scale factor(s)                     | int8 convolutions only                                                 |
-| forward     | attribute | [Zero points](@ref dnnl::primitive_attr::set_zero_points_mask) | Sets zero point(s) for the corresponding tensors                              | int8 convolutions only                                                 |
-| forward     | post-op   | [Eltwise](@ref dnnl::post_ops::append_eltwise)                 | Applies an @ref dnnl_api_eltwise operation to the result                      |                                                                        |
-| forward     | post-op   | [Sum](@ref dnnl::post_ops::append_sum)                         | Adds the operation result to the destination tensor instead of overwriting it |                                                                        |
-| forward     | post-op   | [Binary](@ref dnnl::post_ops::append_binary)                   | Applies a @ref dnnl_api_binary operation to the result                        | General binary post-op restrictions                                    |
-| forward     | post-op   | [Depthwise](@ref dnnl::post_ops::append_dw)                    | Applies a @ref dnnl_api_convolution operation to the result                   | See [a separate section](@ref dev_guide_attributes_post_ops_depthwise) |
+| Propagation | Type      | Operation                                                    | Description                                                                   | Restrictions                                                           |
+| :--         | :--       | :--                                                          | :--                                                                           | :--                                                                    |
+| forward     | attribute | [Scale](@ref dnnl::primitive_attr::set_scales_mask) | Scales the result of convolution by given scale factor(s)                     | int8 convolutions only                                                 |
+| forward     | attribute | [Zero points](@ref dnnl::primitive_attr::set_zero_points_mask)    | Sets zero point(s) for the corresponding tensors                              | int8 convolutions only                                                 |
+| forward     | post-op   | [Eltwise](@ref dnnl::post_ops::append_eltwise)               | Applies an @ref dnnl_api_eltwise operation to the result                      |                                                                        |
+| forward     | post-op   | [Sum](@ref dnnl::post_ops::append_sum)                       | Adds the operation result to the destination tensor instead of overwriting it |                                                                        |
+| forward     | post-op   | [Binary](@ref dnnl::post_ops::append_binary)                 | Applies a @ref dnnl_api_binary operation to the result                        | General binary post-op restrictions                                    |
+| forward     | post-op   | [Depthwise](@ref dnnl::post_ops::append_dw)                  | Applies a @ref dnnl_api_convolution operation to the result                   | See [a separate section](@ref dev_guide_attributes_post_ops_depthwise) |
 
 The following masks are supported by the primitive:
 - 0, which applies one zero point value to an entire tensor, and
@@ -243,10 +248,10 @@ and eltwise primitives for training.
 The library supports any number and order of post operations, but only the
 following sequences deploy optimized code:
 
-| Type of convolutions          | Post-ops sequence supported                  |
-|:------------------------------|:---------------------------------------------|
-| f32, bf16 and f16 convolution | eltwise, sum, sum -> eltwise                 |
-| int8 convolution              | eltwise, sum, sum -> eltwise, eltwise -> sum |
+| Type of convolutions           | Post-ops sequence supported
+| :--                            | :--
+| f32, bf16 and f16 convolution  | eltwise, sum, sum -> eltwise
+| int8 convolution               | eltwise, sum, sum -> eltwise, eltwise -> sum
 
 The operations during attributes and post-ops applying are done in single
 precision floating point data type. The conversion to the actual destination
@@ -336,15 +341,15 @@ algorithms:
 
 - _Direct_. The convolution operation is computed directly using SIMD
   instructions. This is the algorithm used for the most shapes and supports
-  int8, f32, bf16, f16 and f64 (only on GPU engine) data types.
+  int8, f32, bf16 and f64 (only on GPU engine) data types.
 
 - _Winograd_. This algorithm reduces computational complexity of convolution
   at the expense of accuracy loss and additional memory operations. The
   implementation is based on the [Fast Algorithms for Convolutional Neural
   Networks by A. Lavin and S. Gray](https://arxiv.org/abs/1509.09308). The
   Winograd algorithm often results in the best performance, but it is
-  applicable only to particular shapes. Winograd supports
-  GPU (f16 and f32).
+  applicable only to particular shapes. Moreover, Winograd only supports
+  f32 data type.
 
 - _Implicit GEMM_. The convolution operation is reinterpreted in terms of
   matrix-matrix multiplication by rearranging the source data into a
@@ -374,7 +379,31 @@ fall back to an explicit GEMM algorithm.
 @anchor dg_winograd_conv
 ### Winograd Convolution
 
-oneDNN supports the Winograd convolution algorithm only on GPU engine.
+oneDNN supports the Winograd convolution algorithm on systems with
+Intel(R) Advanced Vector Extensions 512 (Intel(R) AVX-512) support and
+Intel Deep Learning Boost (Intel DL Boost)
+under the following conditions:
+
+- Data and weights memory formats are defined by the convolution primitive
+  (user passes `any` as the data format).
+
+- The spatial domain is two-dimensional.
+
+- The weights shape is 3x3, there are no groups, dilation or strides
+  (\f$KH = KW = 3\f$, \f$SH = SW = 1\f$, and \f$DH = DW = 0\f$).
+
+- The data type is f32.
+
+The Winograd convolution algorithm implementation additionally chooses tile
+size based on the problem shape and
+[propagation kind](@ref dnnl_prop_kind_t):
+
+- For `forward_inference` oneDNN supports
+  \f$F(2 \times 2, 3 \times 3)\f$ or
+  \f$F(4 \times 4, 3 \times 3)\f$
+
+- oneDNN supports only \f$F(4 \times 4, 3 \times 3)\f$ Winograd for all
+  the training propagation kinds.
 
 The following side effects should be weighed against the (potential)
 performance boost achieved from using the Winograd algorithm:
@@ -415,10 +444,14 @@ the convolution.)
 1. Refer to @ref dev_guide_data_types for limitations related to data types
    support.
 
-2. See [Winograd Convolution](@ref dg_winograd_conv) section for limitations
-of Winograd algorithm implementations.
+2. Check [Winograd Convolution](@ref dg_winograd_conv) section above for its
+   limitations including hardware support.
 
-3. **GPU**
+3. **CPU**
+   - Integer \dst is not supported for floating point \src and \weights
+   - Backward by data convolution with bias is not supported
+
+4. **GPU**
    - Depthwise post-op is not supported
 
 ## Performance Tips

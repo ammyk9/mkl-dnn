@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -44,6 +44,7 @@ namespace dnnl_impl {
 template <bool quantized>
 struct reorder_t : public kernel_base_t {
 private:
+    dnnl::engine p_engine_;
     allocator_t *g_alloc_;
 
     std::shared_ptr<subgraph_t> subgraph_;
@@ -55,22 +56,16 @@ private:
     constant_cache_t::key_t constant_key_
             = reinterpret_cast<constant_cache_t::key_t>(this);
 
+    bool enable_constant_cache_ = is_constant_cache_enabled();
+
 public:
-    reorder_t() {
-        thread_local_cache_t<execution_args_set_t> res_cache;
-        res_cache.retain();
-
-        if (enabled_constant_cache()) get_global_constant_cache().retain();
-    }
-
     ~reorder_t() override {
         thread_local_cache_t<execution_args_set_t> res_cache;
         res_cache.remove_if_exist(reinterpret_cast<size_t>(this));
-        res_cache.release();
 
-        if (enabled_constant_cache()) {
-            get_global_constant_cache().remove_if_exist(constant_key_);
-            get_global_constant_cache().release();
+        if (enable_constant_cache_) {
+            constant_cache_t constant_cache;
+            constant_cache.remove_if_exist(constant_key_);
         }
     }
 
@@ -82,8 +77,7 @@ public:
         g_alloc_ = reinterpret_cast<graph::allocator_t *>(
                 g_engine->get_allocator());
 
-        subgraph_ = std::make_shared<subgraph_t>(part->get_ops(), p_engine_,
-                part->get_fpmath_mode(), part->get_use_blocked_layout(), true);
+        subgraph_ = std::make_shared<subgraph_t>(part->get_ops(), p_engine_);
         BACKEND_DNNL_CHECK(
                 set_given_inputs_outputs(subgraph_, inputs, outputs));
 
@@ -96,7 +90,6 @@ public:
         BACKEND_DNNL_ADD_PASS(pipeline, binary_canonicalization);
 
         if (quantized) {
-            BACKEND_DNNL_ADD_PASS(pipeline, remove_quant_data_with_no_effect);
             BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_scales);
             BACKEND_DNNL_ADD_PASS(pipeline, fuse_src_scales);
             BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_zero_points);
@@ -115,14 +108,14 @@ public:
 
         pipeline.reset_visualize_arg(true, false);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             BACKEND_DNNL_ADD_PASS(pipeline, constant_propagation);
         }
 
         BACKEND_DNNL_ADD_PASS(pipeline, layout_propagation);
 
         // constant propagation
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             BACKEND_DNNL_ADD_PASS(pipeline, constant_propagation);
         }
 
@@ -192,10 +185,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {
@@ -234,7 +228,6 @@ public:
         }
 
         for (size_t i = 0; i < subgraph_->execs_.size(); i++) {
-            if (subgraph_->is_constant_[i]) continue;
             subgraph_->execs_[i]->execute(p_stream, res->get_exec_args()[i]);
         }
 
@@ -265,10 +258,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {
@@ -308,7 +302,6 @@ public:
         }
 
         for (size_t i = 0; i < subgraph_->execs_.size(); i++) {
-            if (subgraph_->is_constant_[i]) continue;
             returned_event = subgraph_->execs_[i]->execute_sycl(
                     p_stream, res->get_exec_args()[i], deps);
             deps = {returned_event};

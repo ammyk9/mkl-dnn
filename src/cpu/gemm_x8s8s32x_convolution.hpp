@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -68,8 +68,7 @@ struct gemm_x8s8s32x_convolution_fwd_t : public primitive_t {
                                     | skip_mask_t::post_ops
                                     | skip_mask_t::sum_dt,
                             dst_type)
-                    && attr()->post_ops_.check_sum_consistency(dst_type,
-                            /* is_int8 */ true)
+                    && attr()->post_ops_.check_sum_consistent_dt(dst_type)
                     && attr_scales_ok() && zero_points_valid(attr());
             if (!ok) return status::unimplemented;
 

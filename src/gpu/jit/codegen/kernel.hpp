@@ -177,7 +177,7 @@ public:
 
         int esize = operand.mod().getExecSize();
         if (esize == 0) esize = 1;
-        if (esize != expr.type().elems() && !expr.type().is_bool()) {
+        if (esize != expr.type().elems()) {
             ir_assert(expr.type().is_scalar() || esize == 1)
                     << "Expected broadcast.";
             if (operand.is_reg_buf_data() && esize != 1) {
@@ -241,7 +241,6 @@ public:
                   grf_mode == grf_mode_t::any ? reg_allocator_t::warn_all
                                               : reg_allocator_t::warn_default)
         , emu_strategy(hw, exec_cfg.hw_cfg().stepping_id()) {
-        setStepping(exec_cfg.hw_cfg().stepping_id());
         ra_.setRegisterCount(regs_);
     }
 
@@ -358,12 +357,8 @@ public:
                 emov(mod, dst.reg_data(), src0.reg_buf_data().reg_data());
             } else if (src0.is_immediate()) {
                 emov(mod, dst.reg_data(), src0.immediate());
-            } else if (dst.type() == ngen::DataType::uw
-                    || dst.type() == ngen::DataType::ud) {
+            } else if (dst.type() == ngen::DataType::uw) {
                 emov(mod, dst.reg_data(), src0.flag_register());
-                if (src0.is_negated()) {
-                    not_(mod, dst.reg_data(), dst.reg_data());
-                }
             } else {
                 emov(mod | src0.flag_register_mod(), dst.reg_data(), 1);
                 emov(mod | ~src0.flag_register_mod(), dst.reg_data(), 0);
@@ -391,14 +386,7 @@ public:
         if (src1.is_reg_data()) {
             eadd(mod, dst.reg_data(), src0.reg_data(), src1.reg_data());
         } else {
-            if (ngen_is_qw(src1.type())) {
-                auto tmp = ra_.alloc_sub(src1.type());
-                emov(1, tmp, src1.immediate());
-                eadd(mod, dst.reg_data(), src0.reg_data(), tmp);
-                ra_.safeRelease(tmp);
-            } else {
-                eadd(mod, dst.reg_data(), src0.reg_data(), src1.immediate());
-            }
+            eadd(mod, dst.reg_data(), src0.reg_data(), src1.immediate());
         }
     }
 
@@ -463,6 +451,22 @@ public:
         }
     }
 
+    void edp4a(const ngen::InstructionModifier &mod, const ngen_operand_t &dst,
+            const ngen_operand_t &src0, const ngen_operand_t &src1,
+            const ngen_operand_t &src2) {
+        ir_assert(!src0.is_immediate() || !src2.is_immediate());
+        if (src0.is_immediate()) {
+            dp4a(mod, dst.reg_data(), src0.immediate(), src1.reg_data(),
+                    src2.reg_data());
+        } else if (src2.is_immediate()) {
+            dp4a(mod, dst.reg_data(), src0.reg_data(), src1.reg_data(),
+                    src2.immediate());
+        } else {
+            dp4a(mod, dst.reg_data(), src0.reg_data(), src1.reg_data(),
+                    src2.reg_data());
+        }
+    }
+
     void eadd3(const ngen::InstructionModifier &mod, const ngen_operand_t &dst,
             const ngen_operand_t &src0, const ngen_operand_t &src1,
             const ngen_operand_t &src2) {
@@ -511,16 +515,7 @@ public:
     void ediv(const ngen::InstructionModifier &mod, const ngen_operand_t &dst,
             const ngen_operand_t &src0, const ngen_operand_t &src1) {
         if (!src1.is_immediate()) {
-            // Immediate src0 is not supported with fdiv_ieee.
-            if (src0.is_immediate() && hw >= ngen::HW::XeHPC) {
-                auto tmp_src0 = ra_.alloc_sub(src0.type());
-                mov(mod, tmp_src0, src0.immediate());
-                efdiv(mod, dst, ngen_operand_t(reg_buf_data_t(hw, tmp_src0)),
-                        src1);
-                ra_.safeRelease(tmp_src0);
-            } else {
-                efdiv(mod, dst, src0, src1);
-            }
+            efdiv(mod, dst, src0, src1);
         } else {
             auto &src1_imm = src1.immediate();
             int32_t src1_value = to_cpp<int32_t>(src1_imm);
@@ -650,13 +645,10 @@ public:
 
     void eand(const ngen::InstructionModifier &mod, const ngen_operand_t &dst,
             const ngen_operand_t &src0, const ngen_operand_t &src1) {
-        if (src0.is_reg_data() && src1.is_reg_data()) {
+        if (src1.is_reg_data()) {
             and_(mod, dst.reg_data(), src0.reg_data(), src1.reg_data());
         } else {
-            if (src0.is_reg_data())
-                and_(mod, dst.reg_data(), src0.reg_data(), src1.immediate());
-            else
-                and_(mod, dst.reg_data(), src1.reg_data(), src0.immediate());
+            and_(mod, dst.reg_data(), src0.reg_data(), src1.immediate());
         }
     }
 
@@ -677,23 +669,20 @@ public:
 
     // Emulates integer division by a constant.
     // Requirements:
-    //     INT32_MIN <= x <= UINT32_MAX
-    //     0         <  y <= INT32_MAX
+    //     0 <= x <= UINT32_MAX
+    //     0 <  y <= INT32_MAX
     // Computes:
     //     qot = x / y
     //     rem = x % y
     void eidiv(const ngen::InstructionModifier &mod, const ngen::RegData &qot,
             const ngen::RegData &rem, const ngen::RegData &x, uint32_t y) {
-        bool x_signed = utils::one_of(x.getType(), ngen::DataType::b,
-                ngen::DataType::w, ngen::DataType::d);
-        auto div_type = (x_signed ? ngen::DataType::d : ngen::DataType::ud);
         ir_assert(x.getHS() == 0);
         if (ngen::utils::is_zero_or_pow2(y)) {
             auto _x = get_subregister(x);
             if (x.getNeg()) {
                 // Negation modifier has bitwise semantics with shr/and so x
                 // needs to be arithmetically negated first.
-                _x = ra_.alloc_sub(div_type);
+                _x = ra_.alloc_sub(x.getType());
                 mov(1, _x, x);
             }
             if (!qot.isInvalid()) shr(mod, qot, _x, ngen::utils::log2(y));
@@ -705,15 +694,14 @@ public:
         uint32_t m = 0, p = 0;
         eidiv_magicgu(y, m, p);
 
-        auto x_tmp = ra_.alloc().retype(div_type);
-        auto qot_tmp = ra_.alloc().retype(div_type);
+        auto x_tmp = ra_.alloc().ud();
+        auto qot_tmp = ra_.alloc().ud();
         auto _x = x_tmp[0];
         auto _qot = qot_tmp[0];
         mov(1, _x, x);
 
         // qot = (x * m) >> p
-        auto acc = acc0.retype(div_type);
-        mul(1, acc[0], _x, m & 0xFFFF);
+        mul(1, acc0.ud(0), _x, m & 0xFFFF);
         mach(1, _qot, _x, m);
         shr<uint32_t>(1, _qot, _qot, p - 32);
         if (!qot.isInvalid()) mov(mod, qot, _qot);
@@ -795,15 +783,8 @@ public:
     }
 
 protected:
-    // Helper RAII class allocating a temporary GRF buffer aligned at a
-    // register boundary for instructions that require aligned operands.
     class spiller_t {
     public:
-        // rd - register region to align
-        // esize - execution size used with the register region
-        // read - whether operand is to be used as input (needs pre-copy)
-        // write - whether operand is to be used as output (needs post-copy)
-        // force_copy - always copy the region (even if it's aligned)
         spiller_t(ir_kernel_t<hw> *host, const ngen::RegData &rd, int esize,
                 bool read, bool write, bool force_copy)
             : host_(host), rd_(rd), esize_(esize), read_(read), write_(write) {
@@ -813,8 +794,7 @@ protected:
             int hs = rd.getHS();
             int vs = rd.getVS();
             int grf_size = ngen::GRF::bytes(hw);
-            int regs = utils::div_up(
-                    std::max(esize * hs, 1) * rd.getBytes(), grf_size);
+            int regs = utils::div_up(esize * hs * rd.getBytes(), grf_size);
             tmp_range_ = host_->ra_.alloc_range(regs);
             auto tmp = tmp_range_[0].retype(rd_.getType());
             tmp_ = ngen::RegisterRegion(tmp, vs, w, hs);
@@ -878,8 +858,8 @@ protected:
         int grf_size = ngen::GRF::bytes(hw);
         int a_beg = a.getBase() * grf_size + a.getByteOffset();
         int b_beg = b.getBase() * grf_size + b.getByteOffset();
-        int a_end = a_beg + std::max(esize * a.getHS(), 1) * a.getBytes() - 1;
-        int b_end = b_beg + std::max(esize * b.getHS(), 1) * b.getBytes() - 1;
+        int a_end = a_beg + esize * a.getHS() * a.getBytes() - 1;
+        int b_end = b_beg + esize * b.getHS() * b.getBytes() - 1;
         a_beg /= grf_size;
         b_beg /= grf_size;
         a_end /= grf_size;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -63,13 +63,13 @@ struct memory_desc_info_t {
     int ndims;
     data_type_t data_type;
 
-    dim_t offset0;
-    dim_t dims[MAX_NDIMS];
-    dim_t padded_dims[MAX_NDIMS];
+    int offset0;
+    int dims[MAX_NDIMS];
+    int padded_dims[MAX_NDIMS];
 
     int nlevels;
-    dim_t blocks[MAX_NDIMS][max_nlevels + 1];
-    dim_t strides[MAX_NDIMS][max_nlevels + 1];
+    int blocks[MAX_NDIMS][max_nlevels + 1];
+    int strides[MAX_NDIMS][max_nlevels + 1];
 
     static memory_desc_info_t create(const memory_desc_wrapper &mdw) {
         using namespace format_tag;
@@ -231,31 +231,31 @@ struct attr_info_t {
 };
 
 struct offsets_t {
-    dim_t src_off[4][MAX_NDIMS];
-    dim_t wei_off[4][MAX_NDIMS];
-    dim_t dst_off[4][MAX_NDIMS];
+    int src_off[4][MAX_NDIMS];
+    int wei_off[4][MAX_NDIMS];
+    int dst_off[4][MAX_NDIMS];
 };
 
 struct rnn_offsets_t {
-    dim_t src_layer_off[4][MAX_NDIMS];
-    dim_t src_iter_off[4][MAX_NDIMS];
-    dim_t src_iter_c_off[4][MAX_NDIMS];
-    dim_t weights_layer_off[4][MAX_NDIMS];
-    dim_t weights_iter_off[4][MAX_NDIMS];
-    dim_t bias_off[4][MAX_NDIMS];
-    dim_t dst_layer_off[4][MAX_NDIMS];
-    dim_t dst_iter_off[4][MAX_NDIMS];
-    dim_t dst_iter_c_off[4][MAX_NDIMS];
-    dim_t diff_src_layer_off[4][MAX_NDIMS];
-    dim_t diff_src_iter_off[4][MAX_NDIMS];
-    dim_t diff_src_iter_c_off[4][MAX_NDIMS];
-    dim_t diff_weights_layer_off[4][MAX_NDIMS];
-    dim_t diff_weights_iter_off[4][MAX_NDIMS];
-    dim_t diff_bias_off[4][MAX_NDIMS];
-    dim_t diff_dst_layer_off[4][MAX_NDIMS];
-    dim_t diff_dst_iter_off[4][MAX_NDIMS];
-    dim_t diff_dst_iter_c_off[4][MAX_NDIMS];
-    dim_t ws_off[4][MAX_NDIMS];
+    int src_layer_off[4][MAX_NDIMS];
+    int src_iter_off[4][MAX_NDIMS];
+    int src_iter_c_off[4][MAX_NDIMS];
+    int weights_layer_off[4][MAX_NDIMS];
+    int weights_iter_off[4][MAX_NDIMS];
+    int bias_off[4][MAX_NDIMS];
+    int dst_layer_off[4][MAX_NDIMS];
+    int dst_iter_off[4][MAX_NDIMS];
+    int dst_iter_c_off[4][MAX_NDIMS];
+    int diff_src_layer_off[4][MAX_NDIMS];
+    int diff_src_iter_off[4][MAX_NDIMS];
+    int diff_src_iter_c_off[4][MAX_NDIMS];
+    int diff_weights_layer_off[4][MAX_NDIMS];
+    int diff_weights_iter_off[4][MAX_NDIMS];
+    int diff_bias_off[4][MAX_NDIMS];
+    int diff_dst_layer_off[4][MAX_NDIMS];
+    int diff_dst_iter_off[4][MAX_NDIMS];
+    int diff_dst_iter_c_off[4][MAX_NDIMS];
+    int ws_off[4][MAX_NDIMS];
 };
 
 // Convolution
@@ -520,7 +520,6 @@ struct bnorm_conf_t {
     int id, ih, iw;
     int nn, sp, sp_tail, vect_size;
     int stat_sp_nblocks, stat_sp_tail, stat_sp_block;
-    int update_sp_nblocks, update_sp_tail, update_sp_block;
     int reduce_stat_nblocks;
     bool with_relu, use_16mb_unroll, use_nhwc;
     int stat_ic;
@@ -537,22 +536,6 @@ struct bnorm_conf_t {
     bool nhwc_optimized;
     int calc_stat_ic;
     bool use_fused_atomics_reduction;
-    bool use_workaround;
-    int update_sp_unroll;
-    int max_vect_size;
-
-    std::string flags;
-    bool bn_tuning;
-    bool is_blocked_16c;
-    bool is_blocked_16n16c;
-    bool is_blocked_32n16c;
-    bool is_nhwc;
-    bool is_overrided_use_fused_atomics_reduction;
-    bool is_overrided_ic_block;
-    bool is_overrided_max_vect_size;
-    bool is_overrided_stat_sp_block;
-    bool is_overrided_update_sp_block;
-    bool is_overrided_update_sp_unroll;
 
     compute::dispatch_t dispatch_calc_stat;
     compute::dispatch_t dispatch_reduce_stat;
@@ -567,7 +550,6 @@ struct lnorm_conf_t {
     bool is_fwd;
     int ndims;
     int norm_axis;
-    int across_axis;
 
     memory_desc_info_t src_md_info;
     memory_desc_info_t dst_md_info;
@@ -587,7 +569,6 @@ struct lnorm_conf_t {
     int n_chunk_size;
     int n_chunks;
     int vector_size_scaleshift;
-    bool use_src_buffer;
 
     compute::dispatch_t dispatch_scaleshift;
     compute::dispatch_t dispatch_scaleshift_finalize;
@@ -626,8 +607,6 @@ struct binary_conf_t {
     bool is_same_md;
     bool same_src_dt;
     bool with_binary_post_op;
-    bool is_src1_broadcast;
-    bool is_src0_blocked;
 
     memory_desc_info_t src0_md_info;
     memory_desc_info_t src1_md_info;
@@ -641,9 +620,8 @@ struct reduction_phase_t {
     data_type_t src_type, dst_type;
     compute::nd_range_t nd_range;
     compute::kernel_t kernel;
-    dim_t outer_dim_size, reduction_size, inner_dim_size;
-    int vect_size;
-    bool reduce_vector;
+    int reduction_size, initial_size, final_size;
+    int num_reduction_chunks;
     bool is_final, is_first;
 };
 
@@ -654,7 +632,6 @@ struct reduction_conf_t {
     float eps;
     dim_t src_dims[MAX_NDIMS], reduce_dims[MAX_NDIMS], dst_dims[MAX_NDIMS];
     bool is_reduction_dim[MAX_NDIMS];
-    int hwd_reduction_size, hwd_size;
     data_type_t src_type, dst_type;
     memory_desc_info_t src_md_info, dst_md_info;
     compute::dispatch_t dispatch;
@@ -674,7 +651,10 @@ struct reduction_conf_t {
     compute::dispatch_t finalize_dispatch;
 
     // Used by combined implementation
+    int outer_dim_size, inner_dim_size, gws_inner_dim_size;
     std::vector<reduction_phase_t> phases;
+    int inner_dim_per_sg;
+    size_t sp_size[2];
 };
 
 // Reorder
@@ -789,7 +769,8 @@ class zero_points_query_t {
 public:
     bool has_default_values() const { return zps_.has_default_values(arg_); }
     int get_mask() const {
-        int mask = zps_.get(arg_);
+        int mask;
+        zps_.get(arg_, &mask);
         return mask;
     }
     size_t get_count() const { return count_; }
@@ -802,14 +783,15 @@ public:
             const memory_desc_wrapper &mdw, int arg)
         : arg_(arg) {
         zps_ = attr->zero_points_;
-        int mask = zps_.get(arg);
+        int mask;
+        zps_.get(arg, &mask);
         count_ = get_attr_oscales_count(mask, mdw);
     }
 
 private:
     zero_points_t zps_;
-    dim_t count_ = 0;
-    int arg_ = 0;
+    dim_t count_;
+    int arg_;
 };
 
 struct quantization_t {
@@ -927,8 +909,6 @@ struct concat_conf_t {
     int concat_axis;
     int sub_group_size;
     int iter_dim_idx, iter_dim_chunk;
-    scales_query_t scale_src[64];
-    uint64_t scales_mask;
 };
 
 // Elementwise
@@ -1090,7 +1070,7 @@ inline void set_offsets(compute::kernel_ctx_t &kernel_ctx,
     md.compute_strides_compat(strides_compat);
 
     for (int d = 0; d < MAX_NDIMS; ++d) {
-        const dim_t block = block_dims[d];
+        const int block = block_dims[d];
 
         kernel_ctx.define_int(
                 utils::format("%s_B%d", str, d), (d < md.ndims()) ? block : 1);
@@ -1103,8 +1083,7 @@ inline void set_offsets(compute::kernel_ctx_t &kernel_ctx,
     kernel_ctx.define_int(utils::format("%s_OFFSET_PAD", str), md.md_->offset0);
 }
 
-inline void set_offsets(
-        const memory_desc_wrapper &md, dim_t offs[4][MAX_NDIMS]) {
+inline void set_offsets(const memory_desc_wrapper &md, int offs[4][MAX_NDIMS]) {
     dim_t block_dims[DNNL_MAX_NDIMS];
     dim_t strides_compat[2][DNNL_MAX_NDIMS];
 
@@ -1113,7 +1092,7 @@ inline void set_offsets(
     const dims_t &dims = md.dims();
 
     for (int d = 0; d < md.ndims(); ++d) {
-        const dim_t block = block_dims[d];
+        const int block = block_dims[d];
 
         offs[0][d] = block;
         offs[1][d] = strides_compat[0][d];
@@ -1122,7 +1101,7 @@ inline void set_offsets(
     }
 }
 
-inline void def_offsets(const dim_t offs[4][MAX_NDIMS],
+inline void def_offsets(const int offs[4][MAX_NDIMS],
         compute::kernel_ctx_t &kernel_ctx, const char *str, const int ndims) {
 
     for (int d = 0; d < MAX_NDIMS; d++) {
@@ -1182,14 +1161,14 @@ inline void def_memory_desc_info(compute::kernel_ctx_t &kernel_ctx,
     kernel_ctx.define_int(utils::format("%s_NLEVELS", prefix), md_info.nlevels);
 
     for (int d = 0; d < MAX_NDIMS; ++d) {
-        dim_t dim = (d < md_info.ndims) ? md_info.dims[d] : 1;
-        dim_t padded_dim = (d < md_info.ndims) ? md_info.padded_dims[d] : 1;
+        int dim = (d < md_info.ndims) ? md_info.dims[d] : 1;
+        int padded_dim = (d < md_info.ndims) ? md_info.padded_dims[d] : 1;
         kernel_ctx.define_int(utils::format("%s_D%d", prefix, d), dim);
         kernel_ctx.define_int(utils::format("%s_PD%d", prefix, d), padded_dim);
 
         for (int l = 0; l < md_info.nlevels + 1; ++l) {
-            dim_t block = (d < md_info.ndims) ? md_info.blocks[d][l] : 1;
-            dim_t stride = (d < md_info.ndims) ? md_info.strides[d][l] : 0;
+            int block = (d < md_info.ndims) ? md_info.blocks[d][l] : 1;
+            int stride = (d < md_info.ndims) ? md_info.strides[d][l] : 0;
             kernel_ctx.define_int(
                     utils::format("%s_B%d_%d", prefix, d, l), block);
             kernel_ctx.define_int(
@@ -1290,7 +1269,7 @@ inline bool post_ops_with_binary_ok(const primitive_attr_t *attr,
     return is_po_ok;
 }
 
-inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
+inline void def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
         const post_ops_t &post_ops, const dnnl_dims_t *dst_dims) {
     const int po_nop_id = 0;
     const int po_binary_id = 1;
@@ -1360,8 +1339,8 @@ inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
                         break;
                 }
             }
-            CHECK(memory_desc_init_by_tag(weight_mem_desc, weight_ndims,
-                    weight_dims, data_type_t::dnnl_f32, weights_tag));
+            memory_desc_init_by_tag(weight_mem_desc, weight_ndims, weight_dims,
+                    data_type_t::dnnl_f32, weights_tag);
             const memory_desc_wrapper weight_mdw(weight_mem_desc);
             const auto mdi = memory_desc_info_t::create(weight_mdw);
             def_memory_desc_info(kernel_ctx, mdi, bin_arg_name.c_str());
@@ -1372,8 +1351,8 @@ inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
         } else {
             memory_desc_t empty_mem_desc;
             dnnl_dims_t empty_dims = {1, 1, 1, 1};
-            CHECK(memory_desc_init_by_tag(empty_mem_desc, 4, empty_dims,
-                    data_type_t::dnnl_s8, format_tag_t::dnnl_nchw));
+            memory_desc_init_by_tag(empty_mem_desc, 4, empty_dims,
+                    data_type_t::dnnl_s8, format_tag_t::dnnl_nchw);
             const memory_desc_wrapper src1_mdw(empty_mem_desc);
             const auto mdi = memory_desc_info_t::create(src1_mdw);
             def_memory_desc_info(kernel_ctx, mdi, bin_arg_name.c_str());
@@ -1429,13 +1408,12 @@ inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
         }
         po_kernel_args += ", const __global PO_" + std::to_string(idx)
                 + "_BIN_ARG_DATA_T *po_" + std::to_string(idx) + "_binary_arg";
-        return status::success;
     };
 
     for (int idx = 0; idx < post_ops.len(); ++idx, ++nof_supported_post_ops) {
         const std::string bin_arg_name
                 = "PO_" + std::to_string(idx) + "_BIN_ARG";
-        CHECK(add_po_defines(bin_arg_name, post_ops.entry_[idx], idx));
+        add_po_defines(bin_arg_name, post_ops.entry_[idx], idx);
     }
 
     kernel_ctx.define_int("POST_OP_CHAIN_LENGTH", nof_supported_post_ops);
@@ -1446,7 +1424,6 @@ inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
     }
     po_kernel_args += "\"";
     kernel_ctx.add_option(po_kernel_args);
-    return status::success;
 }
 
 inline int append_post_ops_to_arg_list_base(const exec_args_t &args,
@@ -1513,7 +1490,7 @@ inline bool post_ops_preserves_zeroes(
     return preserve_zeroes;
 }
 
-inline status_t def_attr_info(compute::kernel_ctx_t &kernel_ctx,
+inline void def_attr_info(compute::kernel_ctx_t &kernel_ctx,
         const attr_info_t &attr_info, const post_ops_t &post_ops,
         const dnnl_dims_t *dst_dims = nullptr) {
     assert(attr_info.initialized);
@@ -1554,7 +1531,7 @@ inline status_t def_attr_info(compute::kernel_ctx_t &kernel_ctx,
     def_binary_alg_kinds(kernel_ctx);
     def_eltwise_alg_kinds(kernel_ctx);
 
-    return def_post_ops_cfg(kernel_ctx, post_ops, dst_dims);
+    def_post_ops_cfg(kernel_ctx, post_ops, dst_dims);
 }
 
 inline void def_dispatch(compute::kernel_ctx_t &kernel_ctx,

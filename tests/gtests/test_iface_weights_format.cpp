@@ -19,6 +19,10 @@
 
 #include "oneapi/dnnl/dnnl.hpp"
 
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
+#include "tests/test_isa_common.hpp"
+#endif
+
 #include <string>
 #include <vector>
 
@@ -87,9 +91,13 @@ protected:
 
     void SetUp() override {
         for (auto dt : {data_type::f32, data_type::bf16, data_type::f16}) {
-            SKIP_IF(unsupported_prop_kind(prop_kind::forward_training, dt),
-                    "Engine does not support this prop kind with these data "
-                    "types");
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE && DNNL_X64
+            // training for xf16 is currently only supported on avx512_core[+]
+            static const auto isa = get_effective_cpu_isa();
+            static const bool has_avx512_core
+                    = dnnl::is_superset(isa, cpu_isa::avx512_core);
+            if (dt != data_type::f32 && !has_avx512_core) continue;
+#endif
             if (!unsupported_data_type(dt))
                 inner_product_data_types.push_back(dt);
         }

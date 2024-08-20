@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,18 +27,17 @@
 #include <unordered_map>
 
 #include "gpu/jit/conv/config.hpp"
-#include "gpu/jit/conv/config_plan.hpp"
-#include "gpu/jit/conv/normalization.hpp"
+#include "gpu/jit/conv/epilogue.hpp"
 #include "gpu/jit/conv/pipeline.hpp"
-#include "gpu/jit/ir/epilogue.hpp"
+#include "gpu/jit/conv/post_ops.hpp"
+#include "gpu/jit/conv/slm_reduce_builder.hpp"
 #include "gpu/jit/ir/fma.hpp"
 #include "gpu/jit/ir/gemm_schedule.hpp"
 #include "gpu/jit/ir/ir.hpp"
 #include "gpu/jit/ir/message.hpp"
-#include "gpu/jit/ir/post_ops.hpp"
+#include "gpu/jit/ir/mul_add.hpp"
 #include "gpu/jit/ir/reduce.hpp"
 #include "gpu/jit/ir/reorder.hpp"
-#include "gpu/jit/ir/slm_reduce_builder.hpp"
 #include "gpu/jit/ir/tensor.hpp"
 #include "gpu/jit/pass/pass.hpp"
 #include "gpu/jit/utils/trace.hpp"
@@ -151,60 +150,1798 @@ void verify_buffer_access(const stmt_t &s, ir_context_t &ir_ctx) {
     trace_pass("verify_buffer_access", s, ir_ctx);
 }
 
-expr_t add_grid_guard(
-        const expr_t &_cond, const grid_info_t &tg, const grid_info_t &load) {
-    auto cond = _cond;
-    for (int i = 0; i < tg.ndims(); i++) {
-        if (tg[i] == load[i]) continue;
-        auto i_cond = (tg.idx(i) < load[i]);
-        if (cond.is_empty()) {
-            cond = i_cond;
+class multiply_builder_t {
+public:
+    multiply_builder_t() = default;
+
+    multiply_builder_t(const conv_config_t &cfg,
+            const bmnk_mapper_t &bmnk_mapper, const view_t &a_view,
+            const view_t &b_view, const expr_t &a_buf, const expr_t &b_buf,
+            const expr_t &c_buf)
+        : hw_(cfg.hw())
+        , simd_size_(cfg.simd())
+        , bmnk_mapper_(bmnk_mapper)
+        , a_view_(a_view)
+        , b_view_(b_view)
+        , a_buf_(a_buf)
+        , b_buf_(b_buf)
+        , c_buf_(c_buf) {
+        switch (cfg.fma_kind()) {
+            case fma_kind_t::dp4a:
+            case fma_kind_t::dpas:
+            case fma_kind_t::dpasw:
+                if (try_build_dpas()) return;
+                break;
+            case fma_kind_t::mad:
+                if (try_build_mad()) return;
+                break;
+            default: ir_error_not_expected() << "Unknown FMA kind.";
+        }
+
+        ir_error_not_expected()
+                << "Can't decompose into multiplication instructions. A view: "
+                << a_view << ". B view: " << b_view;
+    }
+
+    const stmt_t &stmt() const { return stmt_; }
+
+    const layout_t &c_layout() const { return c_layout_; }
+
+    bool do_transpose() const { return do_transpose_; }
+
+    std::string str() const {
+        std::ostringstream oss;
+        oss << "A view:    " << a_view_ << std::endl;
+        oss << "B view:    " << b_view_ << std::endl;
+        oss << "C layout:  " << c_layout_ << std::endl;
+        oss << "Statement: " << std::endl << stmt_;
+        return oss.str();
+    }
+
+private:
+    struct loop_info_t {
+        loop_info_t() = default;
+
+        loop_info_t(const expr_t &var, bmnk_kind_t bmnk_kind, int dim)
+            : var(var), bmnk_kind(bmnk_kind), dim(dim) {}
+
+        expr_t var;
+        bmnk_kind_t bmnk_kind;
+
+        int dim;
+        int a_idx = -1;
+        int b_idx = -1;
+        int c_idx = -1;
+        int block = 1;
+    };
+
+    bool try_build_dpas() {
+        ir_assert(a_view_.can_convert_to_vlayout())
+                << "Views are not supported with dpas/dpasw.";
+        ir_assert(b_view_.can_convert_to_vlayout())
+                << "Views are not supported with dpas/dpasw.";
+
+        auto a_layout = a_view_.create_vlayout();
+        auto b_layout = b_view_.create_vlayout();
+
+        check_k_blocks_order(a_layout, b_layout);
+
+        bmnk_block_mapper_t from_bmnk_mapper(bmnk_mapper_);
+        from_bmnk_mapper.push_blocks(abc_kind_t::a, a_layout.blocks());
+        from_bmnk_mapper.push_blocks(abc_kind_t::b, b_layout.blocks());
+
+        // Convert to MNK layouts.
+        a_layout = bmnk_mapper_.map_to_bmnk(
+                abc_kind_t::a, {bmnk_kind_t::m, bmnk_kind_t::k}, a_layout);
+        b_layout = bmnk_mapper_.map_to_bmnk(
+                abc_kind_t::b, {bmnk_kind_t::k, bmnk_kind_t::n}, b_layout);
+
+        multiply_desc_t desc(a_layout, b_layout, /*force_c_upconvert=*/true);
+        if (!dpas_t::matches_types(
+                    hw_, desc.a_type(), desc.b_type(), desc.c_type()))
+            return false;
+
+        int sdepth = 8;
+        int rcount = std::min(utils::rnd_up_pow2(desc.n()), 8);
+        auto _dpas = dpas_t::make(/*is_dpasw=*/false, simd_size_, sdepth,
+                rcount, desc.c_type(), desc.a_type(), desc.b_type());
+        if (_dpas.as<dpas_t>().matches(desc)) {
+            build_dpas(from_bmnk_mapper, _dpas.as<dpas_t>(), desc);
+            return true;
+        }
+
+        // Try to transpose and flip: C += A * B -> C^T = B^T * A^T.
+        rcount = std::min(desc.m(), 8);
+        desc = multiply_desc_t(
+                b_layout.transpose(), a_layout.transpose(), true);
+        _dpas = dpas_t::make(/*is_dpasw=*/false, /*exec_size=*/simd_size_,
+                sdepth, rcount, desc.c_type(), desc.a_type(), desc.b_type());
+
+        if (_dpas.as<dpas_t>().matches(desc)) {
+            do_transpose_ = true;
+            build_dpas(from_bmnk_mapper, _dpas.as<dpas_t>(), desc);
+            return true;
+        }
+        return false;
+    }
+
+    void check_k_blocks_order(const layout_t &a, const layout_t &b) const {
+        object_map_t<expr_t, int> k_vars;
+        auto k_sub_layout = [&](abc_kind_t abc_kind, const layout_t &l) {
+            layout_t k_layout = layout_t(type_t::u8(), 0,
+                    std::vector<dim_t>(layout_t::max_ndims, 1));
+            for (auto &b : l.blocks()) {
+                auto bmnk_kind = bmnk_mapper_.bmnk_kind(abc_kind, b.dim_idx);
+                if (bmnk_kind != bmnk_kind_t::k) continue;
+                auto &var = bmnk_mapper_.var(abc_kind, b.dim_idx);
+                auto ret = k_vars.emplace(var, (int)k_vars.size());
+                k_layout = k_layout.add_outer_block(ret.first->second, b.block);
+            }
+            return k_layout;
+        };
+        auto a_k = k_sub_layout(abc_kind_t::a, a);
+        auto b_k = k_sub_layout(abc_kind_t::b, b);
+        ir_assert(a_k == b_k)
+                << "Order of K dimensions doesn't match in A and B. A layout: "
+                << a << ", B layout: " << b;
+    }
+
+    void build_dpas(const bmnk_block_mapper_t &from_bmnk_mapper,
+            const dpas_t &dpas, const multiply_desc_t &desc) {
+        int m_blk = dpas.exec_size;
+        int n_blk = dpas.rcount;
+        int k_blk = dpas.sdepth * 4 / dpas.src1_type.size();
+
+        c_layout_ = compute_dpas_c_layout(m_blk, n_blk, dpas.c_layout(), desc);
+
+        expr_t a_buf = a_buf_;
+        expr_t b_buf = b_buf_;
+        if (do_transpose_) std::swap(a_buf, b_buf);
+        auto dpas_tail = dpas_t::make(/*is_dpasw=*/false, dpas.exec_size,
+                dpas.sdepth, desc.n() > n_blk ? desc.n() % n_blk : n_blk,
+                dpas.dst_type, dpas.src1_type, dpas.src2_type);
+
+        for (int i_k = 0; i_k < desc.k(); i_k += k_blk) {
+            for (int i_m = 0; i_m < desc.m(); i_m += m_blk) {
+                for (int i_n = 0; i_n < desc.n(); i_n += n_blk) {
+                    std::vector<int> a_args = {i_m, i_k};
+                    std::vector<int> b_args = {i_k, i_n};
+                    std::vector<int> c_args = {i_m, i_n};
+                    auto a = a_buf[desc.a_layout()(a_args)
+                            * desc.a_type().size()];
+                    auto b = b_buf[desc.b_layout()(b_args)
+                            * desc.b_type().size()];
+                    auto c = c_buf_[c_layout_(c_args) * desc.c_type().size()];
+                    auto &_dpas = (i_n + n_blk > desc.n())
+                            ? dpas_tail.as<dpas_t>()
+                            : dpas;
+                    stmt_ = stmt_.append(_dpas(c, c, a, b));
+                }
+            }
+        }
+
+        // Transpose C layout back if needed.
+        if (do_transpose_) c_layout_ = c_layout_.transpose();
+
+        // Convert C layout back to problem notation.
+        c_layout_ = from_bmnk_mapper.map_from_bmnk(
+                abc_kind_t::c, {bmnk_kind_t::m, bmnk_kind_t::n}, c_layout_);
+    }
+
+    static layout_t compute_dpas_c_layout(int m_blk, int n_blk,
+            const layout_t &blk_layout, const multiply_desc_t &desc) {
+        auto c_layout = blk_layout;
+        auto new_blocks = c_layout.blocks();
+        if (new_blocks.size() > 1) new_blocks[1].block = desc.n();
+        c_layout = layout_t(c_layout.type(), c_layout.ndims(),
+                c_layout.offset(), new_blocks);
+        c_layout = c_layout.add_outer_block(0, desc.m() / m_blk);
+        return c_layout;
+    }
+
+    bool try_build_mad() {
+        auto loops = create_loop_nest();
+
+        if (try_build_mad_kmn_block_by_n(loops)) return true;
+        if (try_build_mad_kmn_block_by_b(loops)) return true;
+
+        return false;
+    }
+
+    std::vector<loop_info_t> create_loop_nest() const {
+        object_map_t<expr_t, loop_info_t> loops;
+        for (auto *view : {&a_view_, &b_view_}) {
+            abc_kind_t abc_kind
+                    = (view == &a_view_ ? abc_kind_t::a : abc_kind_t::b);
+            for (int i = 0; i < view->nvdims(); i++) {
+                auto &var = bmnk_mapper_.var(abc_kind, i);
+                int dim = int(view->vdims()[i]);
+                if (dim == 1) continue;
+
+                if (loops.count(var) > 0) continue;
+                loops[var] = loop_info_t(var, bmnk_mapper_.bmnk_kind(var), dim);
+            }
+        }
+
+        std::vector<loop_info_t> ret;
+        for (auto &kv : loops) {
+            auto &loop = kv.second;
+            loop.a_idx = bmnk_mapper_.dim_idx(abc_kind_t::a, loop.var);
+            loop.b_idx = bmnk_mapper_.dim_idx(abc_kind_t::b, loop.var);
+            loop.c_idx = bmnk_mapper_.dim_idx(abc_kind_t::c, loop.var);
+            ret.push_back(kv.second);
+        }
+        return ret;
+    }
+
+    // Order of loops: BKMN, block by N.
+    bool try_build_mad_kmn_block_by_n(std::vector<loop_info_t> &_loops) {
+        return try_build_mad_impl(_loops,
+                {bmnk_kind_t::b, bmnk_kind_t::k, bmnk_kind_t::m,
+                        bmnk_kind_t::n},
+                bmnk_kind_t::n);
+    }
+
+    // Order of loops: BKMN, block by B.
+    bool try_build_mad_kmn_block_by_b(std::vector<loop_info_t> &_loops) {
+        return try_build_mad_impl(_loops,
+                {bmnk_kind_t::b, bmnk_kind_t::k, bmnk_kind_t::m,
+                        bmnk_kind_t::n},
+                bmnk_kind_t::b);
+    }
+
+    bool try_build_mad_impl(std::vector<loop_info_t> &_loops,
+            const std::vector<bmnk_kind_t> &loop_order,
+            bmnk_kind_t block_bmnk_kind) {
+        auto loops = _loops;
+        int nloops = int(loops.size());
+        std::sort(loops.begin(), loops.end(),
+                [&](const loop_info_t &a, const loop_info_t &b) {
+                    int a_key = ir_utils::find_index(loop_order, a.bmnk_kind);
+                    int b_key = ir_utils::find_index(loop_order, b.bmnk_kind);
+                    ir_assert(a_key != -1);
+                    ir_assert(b_key != -1);
+                    return a_key < b_key;
+                });
+
+        int block_idx = -1;
+        for (int i = 0; i < nloops; i++) {
+            auto &l = loops[i];
+            if (l.bmnk_kind == block_bmnk_kind) {
+                ir_assert(block_idx == -1) << "Can't block 2+ dimensions.";
+                block_idx = i;
+            }
+        }
+
+        // Couldn't find N dimension, try different blocking scheme.
+        if (block_idx == -1) return false;
+
+        auto &block_loop = loops[block_idx];
+
+        int block = simd_size_;
+        while (block >= 1) {
+            if (block_loop.dim % block == 0) break;
+            block /= 2;
+        }
+
+        ir_assert(block >= 1) << "Invalid block size.";
+        block_loop.block = block;
+
+        int a_stride = 0;
+        int b_stride = 0;
+
+        // Ensure that A tile is dense.
+        if (block_loop.a_idx != -1) {
+            std::vector<dim_t> tile_dims(a_view_.nvdims(), 1);
+            tile_dims[block_loop.a_idx] = block;
+            auto layout = a_view_.create_pseudo_vlayout();
+            auto tile = layout.map(tensor_t(tile_dims));
+            if (!is_1d_strided(tile)) return false;
+            a_stride = tile.blocks()[0].stride;
+        }
+
+        // Ensure that B tile is dense.
+        if (block_loop.b_idx != -1) {
+            std::vector<dim_t> tile_dims(b_view_.nvdims(), 1);
+            tile_dims[block_loop.b_idx] = block;
+            auto layout = b_view_.create_pseudo_vlayout();
+            auto tile = layout.map(tensor_t(tile_dims));
+            if (!is_1d_strided(tile)) return false;
+            b_stride = tile.blocks()[0].stride;
+        }
+
+        build_mad(loops, block_loop, a_stride, b_stride);
+        return true;
+    }
+
+    static bool is_1d_strided(const layout_t &layout) {
+        auto &blocks = layout.blocks();
+        if (blocks.size() > 1) return false;
+        return true;
+    }
+
+    void build_mad(const std::vector<loop_info_t> &loops,
+            const loop_info_t &block_loop, int a_stride, int b_stride) {
+        ir_assert(utils::one_of(
+                block_loop.bmnk_kind, bmnk_kind_t::b, bmnk_kind_t::n))
+                << "Unsupported blocking (expected blocking by B or N).";
+
+        auto &a_type = a_view_.type();
+        auto &b_type = b_view_.type();
+        auto c_type = multiply_desc_t::get_c_type(a_type, b_type,
+                /*force_c_upconvert=*/false);
+
+        int block = block_loop.block;
+        auto _mad = mad_t::make(
+                hw_, c_type, block, a_type, a_stride, b_type, b_stride);
+        auto &mad = _mad.as<mad_t>();
+
+        c_layout_ = compute_mad_c_layout(c_type, loops, block_loop);
+
+        int nloops = int(loops.size());
+        std::vector<int> bounds(loops.size());
+        for (int i = 0; i < nloops; i++) {
+            bounds[i] = loops[i].dim / loops[i].block;
+        }
+        std::vector<int> a_idx(a_view_.nvdims());
+        std::vector<int> b_idx(b_view_.nvdims());
+        std::vector<int> c_idx(c_layout_.ndims());
+        ir_utils::for_each(bounds, [&](const std::vector<int> &idx) {
+            for (int i = 0; i < nloops; i++) {
+                int full_idx = idx[i] * loops[i].block;
+                auto &loop = loops[i];
+                if (loop.a_idx != -1) a_idx[loop.a_idx] = full_idx;
+                if (loop.b_idx != -1) b_idx[loop.b_idx] = full_idx;
+                if (loop.c_idx != -1) c_idx[loop.c_idx] = full_idx;
+            }
+            int a_off = a_view_(a_idx) * a_type.size();
+            int b_off = b_view_(b_idx) * b_type.size();
+            int c_off = c_layout_(c_idx) * c_type.size();
+            stmt_ = stmt_.append(mad(c_buf_[c_off], c_buf_[c_off],
+                    a_buf_[a_off], b_buf_[b_off]));
+        });
+    }
+
+    layout_t compute_mad_c_layout(const type_t &c_type,
+            const std::vector<loop_info_t> &loops,
+            const loop_info_t &block_loop) const {
+        layout_t c_layout(c_type, bmnk_mapper_.ndims(abc_kind_t::c), 0, {});
+
+        int c_dim_idx = bmnk_mapper_.dim_idx(abc_kind_t::c, block_loop.var);
+        c_layout = c_layout.add_outer_block(c_dim_idx, block_loop.block);
+
+        for (size_t i = 0; i < loops.size(); i++) {
+            if (loops[i].bmnk_kind == bmnk_kind_t::k) continue;
+            int dim_idx = bmnk_mapper_.dim_idx(abc_kind_t::c, loops[i].var);
+            int bound = loops[i].dim / loops[i].block;
+            c_layout = c_layout.add_outer_block(dim_idx, bound);
+        }
+        return c_layout;
+    }
+
+    ngen::HW hw_;
+    int simd_size_;
+    bmnk_mapper_t bmnk_mapper_;
+
+    bool do_transpose_ = false;
+
+    view_t a_view_;
+    view_t b_view_;
+    layout_t c_layout_;
+
+    expr_t a_buf_;
+    expr_t b_buf_;
+    expr_t c_buf_;
+
+    stmt_t stmt_;
+};
+
+class fma_helper_t {
+public:
+    fma_helper_t(int simd_size, fma_kind_t fma_kind, const type_t &a_type,
+            const type_t &b_type, bool allow_a_grf_reorder,
+            bool allow_b_grf_reorder, bool is_src1_broadcast)
+        : simd_size_(simd_size)
+        , fma_kind_(fma_kind)
+        , a_type_(a_type)
+        , b_type_(b_type)
+        , allow_a_grf_reorder_(allow_a_grf_reorder)
+        , allow_b_grf_reorder_(allow_b_grf_reorder)
+        , is_src1_broadcast_(is_src1_broadcast) {}
+
+    fma_kind_t fma_kind() const { return fma_kind_; }
+
+    layout_t convert_to_fma_friendly_layout(const layout_t &layout,
+            abc_kind_t abc_kind, bool is_slm, const bmnk_mapper_t &bmnk_mapper,
+            bool *changed = nullptr) const {
+        bool allow_grf_reorder
+                = (abc_kind == abc_kind_t::a ? allow_a_grf_reorder_
+                                             : allow_b_grf_reorder_);
+        if (changed) *changed = false;
+        if (!allow_grf_reorder) return layout;
+
+        // GRF reorder is only supported with dpas/dpasw.
+        if (fma_kind_ == fma_kind_t::mad) {
+            if (is_slm) return layout;
+            // mad may require type conversion, supported for GRF layouts only.
+            return convert_to_fma_friendly_type(layout, abc_kind, changed);
+        }
+
+        std::vector<bmnk_kind_t> bmnk_kinds;
+        if (abc_kind == abc_kind_t::a) {
+            bmnk_kinds.push_back(bmnk_kind_t::m);
+            bmnk_kinds.push_back(bmnk_kind_t::k);
         } else {
-            cond = cond & i_cond;
+            bmnk_kinds.push_back(bmnk_kind_t::k);
+            bmnk_kinds.push_back(bmnk_kind_t::n);
+        }
+
+        auto bmnk_layout
+                = bmnk_mapper.map_to_bmnk(abc_kind, bmnk_kinds, layout);
+
+        auto dpas_layout = get_dpas_friendly_layout(bmnk_layout, abc_kind);
+        if (dpas_layout == bmnk_layout) return layout;
+
+        if (changed) *changed = true;
+
+        bmnk_block_mapper_t from_bmnk_mapper(bmnk_mapper);
+        from_bmnk_mapper.push_blocks(abc_kind, layout.blocks());
+
+        auto fma_layout = from_bmnk_mapper.map_from_bmnk(
+                abc_kind, bmnk_kinds, dpas_layout);
+        fma_layout = fma_layout.make_dense();
+        return fma_layout;
+    }
+
+private:
+    layout_t convert_to_fma_friendly_type(const layout_t &layout,
+            abc_kind_t abc_kind, bool *changed = nullptr) const {
+        if (changed) *changed = false;
+        if (fma_kind_ != fma_kind_t::mad) return layout;
+
+        // mad with s8/u8 is not supported, promote to strided s16.
+        if (a_type_.is_x8() && b_type_.is_x8()) {
+            if (changed) *changed = true;
+            return layout.retype(type_t::s16()).make_strided(2);
+        }
+
+        // bf16 mixed mode mad requires src2 to be f32.
+        if (abc_kind == abc_kind_t::b && a_type_.is_bf16()) {
+            if (changed) *changed = true;
+            return layout.retype(type_t::f32()).make_dense();
+        }
+
+        // bf16 mixed mode mad requires src1 to be packed, when src1 is
+        // broadcasted it needs to be converted to f32.
+        if (abc_kind == abc_kind_t::a && a_type_.is_bf16()
+                && is_src1_broadcast_) {
+            if (changed) *changed = true;
+            return layout.retype(type_t::f32()).make_dense();
+        }
+
+        // Ensure the layout is dense to align regioning.
+        if (!layout.is_dense()) {
+            if (changed) *changed = true;
+            return layout.make_dense();
+        }
+
+        return layout;
+    }
+
+    layout_t get_dpas_friendly_layout(
+            const layout_t &bmnk_layout, abc_kind_t abc_kind) const {
+        bool is_a = (abc_kind == abc_kind_t::a);
+        int mn_idx = (is_a ? 0 : 1);
+        int k_idx = (is_a ? 1 : 0);
+
+        layout_t dpas_layout;
+        dim_t mn_blk = bmnk_layout.dim(mn_idx);
+        dim_t k_blk = bmnk_layout.dim(k_idx);
+
+        std::vector<int> try_rcount;
+        if (is_a && mn_blk % 8 == 0) try_rcount.push_back(8);
+        // Cannot calculate correct r_count when !is_a, but rcount is
+        // effectively ignored in that case as rcount mainly affects b_layout.
+        // Also note that rcount used here may not be supported in hardware and
+        // is used solely to compute layout.
+        try_rcount.push_back(is_a ? mn_blk : 8);
+        for (int rcount : try_rcount) {
+            auto _dpas = dpas_t::make(/*is_dpasw=*/false, simd_size_,
+                    /*sdepth=*/8, rcount, type_t::undef(), b_type_, a_type_);
+            auto &dpas = _dpas.as<dpas_t>();
+
+            dpas_layout = (is_a ? dpas.b_layout() : dpas.a_layout());
+            dpas_layout = dpas_layout.transpose();
+
+            auto default_layout = bmnk_layout.retype(is_a ? a_type_ : b_type_);
+            if (dpas_layout <= default_layout) return default_layout;
+        }
+
+        dim_t dpas_mn_blk = dpas_layout.dim(mn_idx);
+        dim_t dpas_k_blk = dpas_layout.dim(k_idx);
+        ir_assert(k_blk % dpas_k_blk == 0);
+
+        dim_t k_outer = ir_utils::safe_divide(k_blk, dpas_k_blk);
+        dim_t mn_outer = ir_utils::safe_divide(mn_blk, dpas_mn_blk);
+        dpas_layout = dpas_layout.add_outer_block(k_idx, k_outer);
+        dpas_layout = dpas_layout.add_outer_block(mn_idx, mn_outer);
+        return dpas_layout;
+    }
+
+    int simd_size_;
+    fma_kind_t fma_kind_;
+    type_t a_type_;
+    type_t b_type_;
+    bool allow_a_grf_reorder_;
+    bool allow_b_grf_reorder_;
+    bool is_src1_broadcast_;
+};
+
+class b_reduce_context_t {
+public:
+    b_reduce_context_t(ir_context_t &ir_ctx, const conv_config_t &cfg)
+        : ir_ctx_(ir_ctx), cfg_(cfg), reduce_condition_(true) {
+        if (cfg_.reduce_b()) b_reduced_reg_buf_ = make_buffer("b_reduced");
+    }
+
+    // Setters for B reduced memory buffer/view.
+    void set_b_reduced_mem_buf(const expr_t &buf) { b_reduced_mem_buf_ = buf; }
+    void set_b_reduced_view(const view_t &v) { b_reduced_view_ = v; }
+
+    // Sets the condition to update B reduced output. Reduction is done across
+    // K for B (KxN tensor) so M dimension should be checked before the update.
+    void set_reduce_condition(const expr_t &cond) { reduce_condition_ = cond; }
+
+    // Global memory buffer.
+    const expr_t &b_reduced_mem_buf() const { return b_reduced_mem_buf_; }
+
+    // Register buffer.
+    const expr_t &b_reduced_reg_buf() const { return b_reduced_reg_buf_; }
+    int b_reduced_size() const { return b_reduced_size_; }
+
+    // Memory view.
+    const view_t &b_reduced_thr_view() const { return b_reduced_thr_view_; }
+
+    // Register layout.
+    const layout_t &b_reduced_reg_layout() const {
+        return b_reduced_reg_layout_;
+    }
+
+    void init_reduced_thr_view(
+            const tensor_t &b_thr_tile, const expr_t &cond = expr_t()) {
+        ir_assert(b_reduced_thr_view_.is_empty()) << "Can't initialize twice.";
+
+        auto b_reduced_thr_tile = b_to_b_reduced_tile(b_thr_tile);
+        b_reduced_thr_view_
+                = b_reduced_view_.create_sub_view(b_reduced_thr_tile);
+        b_reduced_reg_layout_ = b_reduced_thr_view_.create_dense_vlayout();
+        b_reduced_size_ = b_reduced_reg_layout_.size();
+        b_reduced_size_ = utils::rnd_up(b_reduced_size_, cfg_.grf_size());
+
+        if (!cond.is_empty()) reduce_condition_ &= cond;
+    }
+
+    stmt_t create_reduce_stmt(const layout_t &b_layout, const expr_t &b_buf,
+            const tensor_t &subtile = tensor_t()) {
+        auto reduction_stmt
+                = jit::create_reduce_stmt(b_layout, b_reduced_reg_layout_,
+                        b_buf, b_reduced_reg_buf_, subtile, reduction_mask_);
+        return reduction_stmt;
+    }
+
+    stmt_t create_store_stmt(bool use_atomic) const {
+        auto r2g = make_access_builder(ir_ctx_, b_reduced_thr_view_,
+                b_reduced_mem_buf_, b_reduced_reg_buf_,
+                use_atomic ? send_op_t::atomic_fadd : send_op_t::store,
+                send_address_t::a64);
+        // TODO: Check that layouts match.
+        auto ret = r2g.stmt();
+        if (!reduce_condition_.is_empty()) {
+            ret = if_t::make(reduce_condition_, ret);
+        }
+        return ret;
+    }
+
+private:
+    tensor_t b_to_b_reduced_tile(const tensor_t &b_tile) const {
+        std::vector<dim_t> dims;
+        std::vector<expr_t> start;
+        for (int i = 0; i < b_tile.ndims(); i++) {
+            if ((reduction_mask_ & (1 << i)) != 0) {
+                dims.push_back(b_tile(i));
+                start.push_back(b_tile.start(i));
+            }
+        }
+        return tensor_t(dims, start);
+    }
+
+    ir_context_t &ir_ctx_;
+    const conv_config_t &cfg_;
+
+    expr_t reduce_condition_;
+
+    expr_t b_reduced_mem_buf_;
+    expr_t b_reduced_reg_buf_;
+
+    view_t b_reduced_view_;
+    view_t b_reduced_thr_view_;
+
+    layout_t b_reduced_reg_layout_;
+    int b_reduced_size_ = 0;
+
+    uint32_t reduction_mask_ = (1 << 1) | (1 << 2);
+};
+
+class subtile_info_t {
+public:
+    using post_load_func_t = std::function<stmt_t(
+            const layout_t &, const expr_t &, const tensor_t &)>;
+
+    subtile_info_t(ir_context_t &ir_ctx, const gemm_schedule_t &gemm_schedule,
+            const fma_helper_t &fma_helper, abc_kind_t abc_kind, bool use_slm,
+            bool load_buffered, bool allow_2d_load, int idx,
+            const view_t &mem_view, const tensor_t &subtile,
+            const expr_t &mem_buf, const expr_t &slm_buf, const expr_t &reg_buf,
+            const expr_t &tmp_buf)
+        : ir_ctx_(ir_ctx)
+        , gemm_schedule_(gemm_schedule)
+        , fma_helper_(fma_helper)
+        , abc_kind_(abc_kind)
+        , use_slm_(use_slm)
+        , load_buffered_(load_buffered)
+        , allow_2d_load_(allow_2d_load)
+        , idx_(idx)
+        , mem_view_(mem_view)
+        , subtile_(subtile)
+        , mem_buf_(mem_buf)
+        , slm_buf_(slm_buf)
+        , reg_buf_(reg_buf)
+        , tmp_buf_(tmp_buf) {}
+
+    bool is_loaded() const { return is_loaded_; }
+
+    void set_loaded() { is_loaded_ = true; }
+
+    const view_t &reg_view() const { return reg_view_; }
+
+    int reg_buf_size() const {
+        return utils::rnd_up(reg_layout_.size(), ir_ctx_.grf_size());
+    }
+
+    int tmp_buf_size() const { return tmp_buf_size_; }
+
+    const stmt_t &s2r_load() const { return s2r_load_; }
+
+    const stmt_t &g2r_load() const { return g2r_load_; }
+
+    const send_hint_t &send_hint() const { return send_hint_; }
+
+    void load(const post_load_func_t &post_load = post_load_func_t()) {
+        auto &bmnk_mapper = gemm_schedule_.bmnk_mapper();
+
+        layout_t load_layout;
+        stmt_t &stmt = (use_slm_ ? s2r_load_ : g2r_load_);
+        load_impl(ir_ctx_, load_layout, reg_view_, send_hint_, stmt);
+
+        if (post_load) {
+            stmt = stmt.append(post_load(load_layout, reg_buf_, subtile_));
+        }
+
+        reg_layout_ = load_layout;
+
+        bool changed;
+        auto fma_layout = fma_helper_.convert_to_fma_friendly_layout(
+                reg_layout_, abc_kind_,
+                /*is_slm=*/false, bmnk_mapper, &changed);
+
+        if (changed) {
+            bool is_reorder_nop
+                    = fma_layout.retype(reg_layout_.type()) == reg_layout_
+                    && reg_layout_.type().is_bitwise_compatible(
+                            fma_layout.type());
+
+            if (fma_layout.type() != reg_layout_.type()) {
+                reg_view_ = reg_view_.retype(fma_layout.type());
+            }
+            reg_layout_ = fma_layout;
+            reg_view_.set_tlayout(reg_layout_);
+            if (!is_reorder_nop) {
+                stmt = substitute(stmt, reg_buf_, tmp_buf_);
+                stmt = stmt.append(create_reorder_stmt(
+                        load_layout, reg_layout_, tmp_buf_, reg_buf_));
+                int load_reg_size = int(load_layout.size());
+                load_reg_size
+                        = utils::rnd_up(load_reg_size, ir_ctx_.grf_size());
+                tmp_buf_size_ = std::max(tmp_buf_size_, load_reg_size);
+            }
         }
     }
-    return cond;
-}
 
-stmt_t add_grid_guard(
-        const stmt_t &stmt, const grid_info_t &tg, const grid_info_t &load) {
-    expr_t cond = add_grid_guard(expr_t(), tg, load);
-    if (cond.is_empty()) return stmt;
-    return if_t::make(cond, stmt);
-}
+private:
+    void load_impl(ir_context_t &ir_ctx, layout_t &load_layout,
+            view_t &load_view, send_hint_t &send_hint, stmt_t &stmt) const {
+        view_t mem_view = mem_view_;
+        if (load_buffered_)
+            mem_view_.try_create_buffer_view(mem_view, load_view);
+
+        send_op_t send_op = send_op_t::load;
+        send_hint = get_send_hint(ir_ctx_.exec_cfg(), send_op_t::load,
+                fma_helper_.fma_kind(), abc_kind_, mem_view, gemm_schedule_,
+                allow_2d_load_);
+        auto read = make_access_builder(ir_ctx, mem_view,
+                use_slm_ ? slm_buf_ : mem_buf_, reg_buf_, send_op,
+                use_slm_ ? send_address_t::slm : send_address_t::a64,
+                send_hint);
+        ir_trace() << (abc_kind_ == abc_kind_t::a ? "A" : "B")
+                   << " GMEM/SLM to GRF load #" << idx_ << ":\n"
+                   << read.str() << std::endl;
+
+        load_layout = read.reg_layout();
+        if (!load_view.is_empty()) {
+            load_view.set_tlayout(load_layout);
+        } else {
+            load_view = view_t(load_layout);
+        }
+        stmt = read.stmt();
+    }
+
+    ir_context_t &ir_ctx_;
+    const gemm_schedule_t &gemm_schedule_;
+    const fma_helper_t &fma_helper_;
+    abc_kind_t abc_kind_;
+    bool use_slm_;
+    bool load_buffered_;
+    bool allow_2d_load_;
+    int idx_;
+    view_t mem_view_;
+    tensor_t subtile_;
+
+    expr_t mem_buf_;
+    expr_t slm_buf_;
+    expr_t reg_buf_;
+    expr_t tmp_buf_;
+
+    bool is_loaded_ = false;
+    view_t reg_view_;
+    layout_t reg_layout_;
+    int tmp_buf_size_ = 0;
+    stmt_t s2r_load_;
+    stmt_t g2r_load_;
+    send_hint_t send_hint_;
+};
+
+class load_multiply_builder_t {
+public:
+    load_multiply_builder_t(const conv_config_t &cfg, ir_context_t &ir_ctx,
+            const gemm_schedule_t &gemm_schedule,
+            const fma_helper_t &fma_helper, b_reduce_context_t &b_reduce_ctx,
+            const expr_t &ap_buf, const expr_t &a_slm_buf, const expr_t &bp_buf,
+            const expr_t &b_slm_buf, const view_t &ap_x_view,
+            const view_t &bp_x_view, const kernel_info_t &kernel_info)
+        : prb_(cfg.prb())
+        , cfg_(cfg)
+        , ir_ctx_(ir_ctx)
+        , gemm_schedule_(gemm_schedule)
+        , fma_helper_(fma_helper)
+        , b_reduce_ctx_(b_reduce_ctx)
+        , ap_buf_(ap_buf)
+        , a_slm_buf_(a_slm_buf)
+        , bp_buf_(bp_buf)
+        , b_slm_buf_(b_slm_buf)
+        , kernel_info_(kernel_info) {
+        ir_assert(cfg_.subtiles().a() == 1 || cfg_.subtiles().b() == 1)
+                << "At most one tensor can be tiled.";
+
+        ab_tmp_buf_ = make_buffer("ab_tmp");
+        a_buf_ = make_buffer("a");
+        b_buf_ = make_buffer("b");
+        c_buf_ = make_buffer("c");
+
+        // Views to multiply by a thread.
+        a_thr_view_ = ap_x_view.create_sub_view(gemm_schedule_.a_thr_tile());
+        b_thr_view_ = bp_x_view.create_sub_view(gemm_schedule_.b_thr_tile());
+
+        // Initialize view for reduced B.
+        if (cfg_.reduce_b() && !cfg_.slm().b()) {
+            b_reduce_ctx_.init_reduced_thr_view(
+                    gemm_schedule_.b_thr_tile(/*is_relative=*/false));
+        }
+
+        // TODO: Specify loops over subtiles in the schedule, use unrolling.
+        // Sub-tile indices.
+        a_idx_ = ir_ctx_.create_tmp_var(type_t::s32(), "a_idx");
+        b_idx_ = ir_ctx_.create_tmp_var(type_t::s32(), "b_idx");
+
+        // Sub-tile views.
+        a_i_view_ = create_subtile_view(abc_kind_t::a, a_thr_view_,
+                cfg_.subtiles().a(), a_idx_, bmnk_kind_t::m, &a_i_outer_blocks_,
+                a_i_tile_);
+        b_j_view_ = create_subtile_view(abc_kind_t::b, b_thr_view_,
+                cfg_.subtiles().b(), b_idx_, bmnk_kind_t::n, &b_j_outer_blocks_,
+                b_j_tile_);
+
+        build();
+    }
+
+    const std::vector<stmt_t> &allocs() const { return allocs_; }
+
+    const stmt_t &load_mul_stmt() const { return load_mul_stmt_; }
+
+    const expr_t &c_buf() const { return c_buf_; }
+
+    const layout_t &c_reg_layout() const { return c_reg_layout_; }
+
+private:
+    view_t create_subtile_view(abc_kind_t abc_kind, const view_t &thr_view,
+            int subtiles, const expr_t &idx, bmnk_kind_t bmnk_kind,
+            std::vector<block_t> *outer_blocks, tensor_t &subtile) const {
+        auto &bmnk_mapper = gemm_schedule_.bmnk_mapper();
+        auto layout = thr_view.create_pseudo_vlayout();
+        dim_t mn_dim = 1;
+        for (auto &b : layout.blocks()) {
+            auto b_bmnk_kind = bmnk_mapper.bmnk_kind(abc_kind, b.dim_idx);
+            if (b_bmnk_kind == bmnk_kind) mn_dim *= b.block;
+        }
+
+        std::vector<dim_t> subtile_dims(thr_view.nvdims(), 1);
+        dim_t mn_subtile_dim = ir_utils::safe_divide(mn_dim, dim_t(subtiles));
+        for (auto &b : layout.blocks()) {
+            auto b_bmnk_kind = bmnk_mapper.bmnk_kind(abc_kind, b.dim_idx);
+            if (b_bmnk_kind == bmnk_kind) {
+                if (mn_subtile_dim == 1) continue;
+                dim_t next_block;
+                if (mn_subtile_dim % b.block == 0) {
+                    next_block = b.block;
+                } else {
+                    ir_assert(b.block % mn_subtile_dim == 0);
+                    next_block = mn_subtile_dim;
+                }
+                subtile_dims[b.dim_idx] *= next_block;
+                mn_subtile_dim /= next_block;
+            } else {
+                subtile_dims[b.dim_idx] *= b.block;
+            }
+        }
+        grid_info_t grid({subtiles}, {idx});
+        subtile = layout.split(tensor_t(subtile_dims), grid, outer_blocks);
+        return thr_view.create_sub_view(subtile);
+    }
+
+    void build() {
+        int max_iters = 2;
+        bool load_ok = false;
+        for (int iter = 0; iter < max_iters; iter++) {
+            if (try_load_subtiles(/*allow_2d_load=*/iter == 0)) {
+                load_ok = true;
+                break;
+            }
+        }
+        ir_assert(load_ok) << "Can't generate load statements for subtiles.";
+
+        auto a_subtiles = cfg_.subtiles().a();
+        auto b_subtiles = cfg_.subtiles().b();
+
+        for (int i = 0; i < a_subtiles; i++) {
+            for (int j = 0; j < b_subtiles; j++) {
+                build_subtile(i, j);
+            }
+        }
+
+        if (zp_buf_size_ > 0)
+            register_buffer(zp_buf_, zp_buf_size_, alloc_kind_t::grf);
+        if (zp_mask_size_ > 0)
+            register_buffer(zp_mask_, zp_mask_size_, alloc_kind_t::grf);
+
+        // Handle temporary buffer in case of GRF reorders.
+        int tmp_buf_size = 0;
+        for (int i = 0; i < a_subtiles; i++)
+            tmp_buf_size
+                    = std::max(tmp_buf_size, a_subtiles_[i].tmp_buf_size());
+        for (int j = 0; j < b_subtiles; j++)
+            tmp_buf_size
+                    = std::max(tmp_buf_size, b_subtiles_[j].tmp_buf_size());
+        if (tmp_buf_size > 0)
+            register_buffer(ab_tmp_buf_, tmp_buf_size, alloc_kind_t::grf);
+
+        // C layout in problem notation.
+        auto c_layout = c_subtile_layout_;
+
+        // Add outer blocks coming from A/B subtiles.
+        auto &bmnk_mapper = gemm_schedule_.bmnk_mapper();
+        for (auto &b : a_i_outer_blocks_) {
+            auto &var = bmnk_mapper.var(abc_kind_t::a, b.dim_idx);
+            int c_dim_idx = bmnk_mapper.dim_idx(abc_kind_t::c, var);
+            c_layout = c_layout.add_outer_block(c_dim_idx, b.block);
+        }
+        for (auto &b : b_j_outer_blocks_) {
+            auto &var = bmnk_mapper.var(abc_kind_t::b, b.dim_idx);
+            int c_dim_idx = bmnk_mapper.dim_idx(abc_kind_t::c, var);
+            c_layout = c_layout.add_outer_block(c_dim_idx, b.block);
+        }
+
+        c_reg_layout_ = c_layout;
+    }
+
+    bool can_use_2d_load(const abc_kind_t &abc_kind, const view_t &view) const {
+        bool is_blocked = view.tlayout().innermost_block_layout().elems() > 1;
+        if (!is_blocked) return true;
+
+        // In general we want to skip expensive logic to check requirements for
+        // 2D block messages with block layouts as performance with 1D messages
+        // is good enough. However there are a few cases (backward by weights
+        // with dpas) when 2D block messages give boost even for block layouts
+        // due to VNNI/transpose features.
+        if (prb_.is_bwd_w && cfg_.is_dp_fma()) {
+            auto &bmnk_mapper = gemm_schedule_.bmnk_mapper();
+            auto &blocks = view.tlayout().blocks();
+            if (blocks.size() < 2) return false;
+            int b1_dim_idx = blocks[1].dim_idx;
+            return bmnk_mapper.bmnk_kind(abc_kind, b1_dim_idx)
+                    == bmnk_kind_t::k;
+        }
+        return false;
+    }
+
+    bool try_load_subtiles(bool allow_2d_load) {
+        int a_subtiles = cfg_.subtiles().a();
+        int b_subtiles = cfg_.subtiles().b();
+        bool use_a_slm = cfg_.slm().a();
+        bool use_b_slm = cfg_.slm().b();
+        a_subtiles_.clear();
+        b_subtiles_.clear();
+        for (int i = 0; i < a_subtiles; i++) {
+            auto view = a_i_view_.substitute(a_idx_, i);
+            auto tile = a_i_tile_.substitute(a_idx_, i);
+            // Using buffered view is enabled only when:
+            // - Loading directly from global memory
+            // - FMA kind is mad (dpas implementation is more strict and requires
+            //   layouts, not views)
+            // - Loading A tensor (A - activations for FWD/BWD_D where we may have
+            //   overlapping when applying KW blocking )
+            bool load_buffered = cfg_.ow_kw_grf_cache() && !use_a_slm
+                    && cfg_.fma_kind() == fma_kind_t::mad;
+            a_subtiles_.emplace_back(ir_ctx_, gemm_schedule_, fma_helper_,
+                    abc_kind_t::a, use_a_slm, load_buffered,
+                    allow_2d_load && can_use_2d_load(abc_kind_t::a, a_i_view_),
+                    i, view, tile, ap_buf_, a_slm_buf_, a_buf_, ab_tmp_buf_);
+            a_subtiles_.back().load();
+        }
+        subtile_info_t::post_load_func_t b_post_load;
+        if (!use_b_slm && cfg_.reduce_b()) {
+            b_post_load = [&](const layout_t &reg_layout, const expr_t &reg_buf,
+                                  const tensor_t &tile) {
+                return b_reduce_ctx_.create_reduce_stmt(
+                        reg_layout, reg_buf, tile);
+            };
+        }
+        for (int j = 0; j < b_subtiles; j++) {
+            auto view = b_j_view_.substitute(b_idx_, j);
+            auto tile = b_j_tile_.substitute(b_idx_, j);
+            b_subtiles_.emplace_back(ir_ctx_, gemm_schedule_, fma_helper_,
+                    abc_kind_t::b, use_b_slm,
+                    /*load_buffered=*/false,
+                    allow_2d_load && can_use_2d_load(abc_kind_t::b, b_j_view_),
+                    j, view, tile, bp_buf_, b_slm_buf_, b_buf_, ab_tmp_buf_);
+
+            b_subtiles_.back().load(b_post_load);
+        }
+
+        // Validate subtile loads, when VNNI permutation is applied, both A/B
+        // have to use the same pattern.
+        int vnni_permute_factor
+                = a_subtiles_[0].send_hint().hint_2d.vnni_permute_factor;
+        for (int i = 1; i < a_subtiles; i++) {
+            int f = a_subtiles_[i].send_hint().hint_2d.vnni_permute_factor;
+            if (f != vnni_permute_factor) return false;
+        }
+        for (int j = 0; j < b_subtiles; j++) {
+            int f = b_subtiles_[j].send_hint().hint_2d.vnni_permute_factor;
+            if (f != vnni_permute_factor) return false;
+        }
+        return true;
+    }
+
+    class src_zp_mask_info_t {
+    public:
+        src_zp_mask_info_t() = delete;
+        src_zp_mask_info_t(load_multiply_builder_t &lmb, int m_blk, int k_blk,
+                int desc_m, int desc_n, int channels, int a_stride, bool is_mad,
+                const view_t &a_view, expr_t &zp_mask, int &zp_mask_size)
+            : lmb_(lmb)
+            , is_const_(true)
+            , is_simd_(true)
+            , is_scalar_(false)
+            , is_wide_(m_blk < 16)
+            , zp_mask_(zp_mask) {
+            const auto tile
+                    = lmb_.gemm_schedule_.a_thr_tile(/*is_relative=*/false);
+            const auto a_thr_view
+                    = lmb_.gemm_schedule_.a_view().create_sub_view(tile);
+            const auto ic_dim = (!is_mad) ? 2 : 1;
+            ic_start_ = a_thr_view.vstart(ic_dim);
+
+            // 0. Are the masks at all required?
+            const auto &prb = lmb_.prb_;
+            const auto dims = tile.dims()[3] * tile.dims()[4] * tile.dims()[5];
+            const auto is_scalar = !is_mad && (dims <= 1);
+
+            const auto has_pad = (prb.pd + 1) * (prb.ph + 1) * (prb.pw + 1) > 1;
+            const auto has_stride_bd
+                    = prb.is_bwd_d && (prb.sd * prb.sh * prb.sw > 1);
+
+            // 1. Get the raw representation of the buffer`s masks
+            auto mask_tensor
+                    = a_thr_view.create_mask_tensor(lmb_.ir_ctx_.cset());
+
+            // 2. Collect the masks, transforming the dimensions as needed
+            int channels_blk = std::min(channels,
+                    (int)a_thr_view.tlayout().normalize().blocks()[0].block);
+            if (channels_blk > 32) channels_blk = 32;
+            const auto c_blk = std::min(channels_blk, m_blk);
+            auto a_tdims = a_view.tlayout().dims();
+            auto mask_blk = is_mad ? c_blk : channels_blk;
+            size_ = ((prb.kd * prb.kh * prb.kw > 1) || has_pad || has_stride_bd)
+                    * ((!is_scalar) ? accumulate(a_tdims.begin(), a_tdims.end(),
+                                              1, std::multiplies<dim_t>())
+                                            / mask_blk
+                                    : 1);
+            if (size_ == 0) return;
+
+            mask_tensor_t masks(
+                    layout_t(type_t::_bool(), 0, std::vector<dim_t> {size_}));
+            std::vector<dim_t> a_dims(a_view.tlayout().ndims(), 1);
+            a_dims[ic_dim] = mask_blk;
+            int i = 0;
+            a_view.tlayout().for_each_tile(
+                    tensor_t(a_dims), [&](const std::vector<dim_t> &start) {
+                        std::vector<dim_t> a_st(a_thr_view.nvdims(), 0);
+                        for (int idx = 0; idx < (int)start.size(); idx++) {
+                            auto tdim_to_vdims = [&](int idx) {
+                                const auto &tdim = a_view.tdim(idx);
+                                auto vidx0 = tdim.vidx(0);
+                                auto vidx1 = -1;
+                                int vdim1 = 0;
+                                ir_assert(tdim.nvargs() <= 2);
+                                for (int vdim0 = 0;
+                                        vdim0 < a_thr_view.vdims()[vidx0];
+                                        vdim0++) {
+                                    auto tdim_expr = substitute(tdim.expr(),
+                                            a_view.vvars()[vidx0],
+                                            to_expr(vdim0));
+                                    if (tdim.nvargs() == 2) {
+                                        vidx1 = tdim.vidx(1);
+                                        for (vdim1 = 0; vdim1
+                                                < a_thr_view.vdims()[vidx1];
+                                                vdim1++) {
+                                            auto tdim_expr2 = substitute(
+                                                    tdim_expr,
+                                                    a_view.vvars()[vidx1],
+                                                    to_expr(vdim1));
+                                            if (to_cpp<dim_t>(
+                                                        simplify(tdim_expr2))
+                                                    == start[idx]) {
+                                                a_st[vidx1] = vdim1;
+                                                a_st[vidx0] = vdim0;
+                                                return;
+                                            }
+                                        }
+                                        tdim_expr = substitute(tdim_expr,
+                                                a_view.vvars()[vidx1],
+                                                to_expr(0));
+                                    }
+                                    if (to_cpp<dim_t>(simplify(tdim_expr))
+                                            == start[idx]) {
+                                        a_st[vidx0] = vdim0;
+                                        break;
+                                    }
+                                }
+                            };
+                            tdim_to_vdims(idx);
+                        }
+                        auto off = a_thr_view.create_pseudo_vlayout()
+                                           .make_dense()
+                                           .offset<dim_t>(a_st);
+                        if (i >= size_) return;
+                        masks.set_mask(i, mask_tensor.mask(off));
+                        i++;
+                    });
+
+            // 3. Compute some basic properties of the masks just collected
+            for (int n = 0; n < size_; n++) {
+                auto *sh = masks.mask(n).as_ptr<shuffle_t>();
+                is_simd_ &= !sh || sh->is_broadcast();
+                is_const_ &= !!sh;
+                for (int v = (sh) ? 0 : c_blk; v < c_blk; v++)
+                    is_const_ &= sh->vec[sh->idx[v]].is<bool_imm_t>();
+            }
+
+            // 4. Scalarize if the masks permit, transform to shorts otherwise
+            for (int n = 0; n < size_; n++)
+                if (is_simd_) {
+                    object_map_t<expr_t, std::vector<expr_t>> vars;
+                    expr_scalarizer_t sc(c_blk, 0, vars);
+                    masks.set_mask(n, sc.mutate(masks.mask(n)));
+                } else if (is_const_) {
+                    uint16_t mask = 0;
+                    auto &sh = masks.mask(n).as<shuffle_t>();
+                    for (int v = c_blk; v; v--)
+                        mask = mask * 2
+                                + sh.vec[sh.idx[v - 1]].as<bool_imm_t>().value;
+                    masks.set_mask(n, mask);
+                } else {
+                    ir_error_not_expected() << "Non-SIMD non-constant masks!";
+                }
+
+            // 5. Assume lack of masks if they all are true
+            bool all_true = true;
+            for (int n = 0; all_true && (n < size_); n++)
+                all_true &= masks.mask(n).is_equal(expr_t(true));
+            if (all_true) {
+                is_const_ = true;
+                is_simd_ = true;
+                size_ = 0;
+                return;
+            }
+            is_scalar_ = is_scalar;
+
+            // 6. zp_mask_ gets created by the caller; allocate var_mask_
+            var_mask_ = lmb_.ir_ctx_.create_tmp_var(
+                    (!is_bool()) ? type_t::s16() : type_t::_bool(16));
+
+            // 7. Vectorize everything for easier computation and emit the IR
+            if (!is_scalar) {
+                std::vector<expr_t> exprs;
+                object_eq_map_t<expr_t, expr_t> vars;
+
+                // Here we assume two important things:
+                // - C has exactly one N block like 4c16f8c (where f is ow)
+                // - The innermost block is by M and it matches the SIMD size
+
+                std::vector<expr_t> proto(size_);
+                if (is_wide_) {
+                    for (int n = 0; n < int(proto.size()); n++) {
+                        const auto r = (n / 2 / k_blk) * 2 * k_blk
+                                + (n / 2) % k_blk + (n & 1) * k_blk;
+                        proto[n] = masks.mask(r % size_);
+                    }
+                } else {
+                    for (int n = 0; n < int(proto.size()); n++)
+                        proto[n] = masks.mask(n % size_);
+                }
+                for (; size_ >= m_blk * 2; size_ /= 2) {
+                    auto c = [](expr_t &a, expr_t &b) { return a.is_equal(b); };
+                    auto half = proto.begin() + size_ / 2;
+                    if (!std::equal(proto.begin(), half, half, c)) break;
+                }
+
+                const auto blk
+                        = (size_ > m_blk) ? std::min(m_blk * 2, 16) : m_blk;
+                for (int n = 0; n < size_; n += blk) {
+                    std::vector<expr_t> e(blk);
+                    for (int m = 0; m < blk; m++) {
+                        e[m] = proto[n + m % (size_ - n)];
+                    }
+                    int ntrue = 0, nfalse = 0;
+                    for (int m = 0; m < blk; m++) {
+                        if (e[m].is<bool_imm_t>())
+                            ((e[m].as<bool_imm_t>().value) ? ntrue : nfalse)++;
+                    }
+                    ir_assert((ntrue == 0) || (ntrue + nfalse == blk));
+                    if ((ntrue == 0) && (nfalse > 0) && (nfalse < blk)) {
+                        auto nb = *std::find_if(e.begin(), e.end(),
+                                [](expr_t &x) { return !x.is<bool_imm_t>(); });
+                        for (int m = 0; m < blk; m++) {
+                            e[m] = (e[m].is<bool_imm_t>())
+                                    ? (nb & expr_t(false))
+                                    : (e[m] & expr_t(true));
+                        }
+                    }
+                    exprs.emplace_back(vector2expr(e, vars));
+                }
+
+                const auto real_size = std::max(
+                        size_ * ((is_wide_) ? 8 : 1), int(exprs.size()) * blk);
+                zp_mask_size = std::max(zp_mask_size, real_size * w_stride());
+                for (int i = 0; i < int(exprs.size()); i++) {
+                    auto expr = cast_t::make(w_type(blk), exprs[i]);
+                    stmt_ = stmt_.append(
+                            store_t::make(zp_mask_, i * blk * w_stride(),
+                                    (is_simd_) ? -expr : expr, w_stride()));
+                }
+                if (is_wide_) {
+                    auto wide_scalar = [&](const expr_t &a, const expr_t &b) {
+                        std::vector<int> idx(16, 1);
+                        for (int i = 0; i < 8; i++)
+                            idx[i] = 0;
+                        return shuffle_t::make(std::vector<expr_t> {a, b}, idx);
+                    };
+                    for (int i = size_ - 2; i > 0; i -= 2) {
+                        auto load_l = load_t::make(
+                                type_t::s16(), zp_mask_, i * w_stride());
+                        auto load_h = load_t::make(
+                                type_t::s16(), zp_mask_, (i + 1) * w_stride());
+                        auto load = wide_scalar(load_l, load_h);
+                        load = cast_t::make(type_t::s16(16), load);
+                        stmt_ = stmt_.append(store_t::make(zp_mask_,
+                                i * 8 * w_stride(), load, w_stride()));
+                    }
+                    if (size_ % 2 == 0) {
+                        auto l0h = load_t::make(
+                                type_t::s16(), zp_mask_, w_stride());
+                        stmt_ = stmt_.append(store_t::make(zp_mask_,
+                                8 * w_stride(),
+                                shuffle_t::make_broadcast(l0h, 8), w_stride()));
+                    }
+                    auto l0l = load_t::make(type_t::s16(), zp_mask_, 0);
+                    stmt_ = stmt_.append(store_t::make(zp_mask_, 0,
+                            shuffle_t::make_broadcast(l0l, 8), w_stride()));
+                }
+
+                for (auto &v : vars)
+                    stmt_ = let_t::make(v.second, v.first, stmt_);
+            } else { // is_scalar == true
+                zp_mask_size = std::max(zp_mask_size, type_t::s16().size());
+                auto expr = cast_t::make(type_t::s16(), masks.mask(0));
+                if (is_simd_) expr = cast(-expr, type_t::s16());
+                stmt_ = stmt_.append(store_t::make(zp_mask_, 0, expr));
+            }
+        }
+
+        const stmt_t &stmt() const { return stmt_; }
+        expr_t ic_start() const { return ic_start_; }
+        bool is_scalar() const { return is_scalar_; }
+        bool is_simd() const { return is_simd_; }
+        bool is_const() const { return is_const_; }
+        bool is_bool() const { return !size_ || !is_simd() || is_scalar(); }
+
+        expr_t gen_mask(int base) const {
+            auto null_mask = (is_bool()) ? expr_t() : expr_t(-1);
+            if (!size_ || is_scalar_) return (size_) ? var_mask_ : null_mask;
+            return word2bool(base % size_);
+        }
+
+        expr_t maybe_gen_mask_let(const stmt_t &loop) const {
+            return (size_ && is_scalar_)
+                    ? let_t::make(var_mask_, word2bool(0), loop)
+                    : loop;
+        }
+
+    private:
+        type_t w_type(int width = 1) const {
+            return (is_bool()) ? type_t::u16(width) : type_t::s32(width);
+        }
+        int w_stride() const { return w_type().size(); }
+
+        expr_t word2bool(int off) const {
+            auto type = (is_bool()) ? type_t::u16() : type_t::s16(16);
+            expr_t load;
+            if (is_wide_ && !is_bool()) {
+                load = load_t::make(
+                        type, zp_mask_, off * 8 * w_stride(), w_stride());
+            } else {
+                load = load_t::make(
+                        type.scalar(), zp_mask_, off * w_stride(), w_stride());
+                if (!is_bool()) load = shuffle_t::make_broadcast(load, 16);
+            }
+            return (is_bool()) ? cast_t::make(type_t::_bool(16), load) : load;
+        }
+
+        expr_t vector2expr(const std::vector<expr_t> &expr,
+                object_eq_map_t<expr_t, expr_t> &vars) const {
+            constexpr size_t mask = 0x8000;
+            auto hash = [&](const binary_op_t &b) -> size_t {
+                return size_t(b.op_kind) | ((b.b.is<int_imm_t>()) ? mask : 0UL);
+            };
+            auto fetch_var = [this, &vars](expr_t e) {
+                if (vars.find(e) == vars.end()) {
+                    auto var = lmb_.ir_ctx_.create_tmp_var(
+                            type_t::s32(e.type().elems()), "zp_mask");
+                    vars.emplace(e, var);
+                }
+                return vars[e];
+            };
+            if (expr.empty()) return expr_t();
+            // Can only vectorize if the element count is a power of 2
+            ir_assert(math::is_pow2(expr.size())) << "Cannot vectorize.";
+
+            std::unordered_map<size_t, size_t> kind;
+            for (const expr_t &e : expr)
+                if (const auto *bin = e.as_ptr<binary_op_t>()) {
+                    kind[hash(*bin)]++;
+                    auto bin_a = bin;
+                    while ((bin_a = bin_a->a.as_ptr<binary_op_t>())) {
+                        if (kind[hash(*bin_a)] > 0) {
+                            kind[hash(*bin)] += kind[hash(*bin_a)];
+                            break;
+                        }
+                    }
+                }
+            if (!kind.empty()) {
+                using k_type = decltype(kind)::value_type;
+                auto k = std::max_element(
+                        kind.begin(), kind.end(), [](k_type &a, k_type &b) {
+                            return a.second < b.second;
+                        });
+                const auto k_raw = op_kind_t(k->first & (mask - 1));
+                std::vector<expr_t> a, b;
+                for (const expr_t &e : expr) {
+                    const auto *bin = e.as_ptr<binary_op_t>();
+                    if (bin && (hash(*bin) == k->first)) {
+                        a.emplace_back(bin->a);
+                        b.emplace_back(bin->b);
+                    } else {
+                        const int is_mul = (k_raw == op_kind_t::_mul);
+                        ir_assert(is_mul || (k_raw == op_kind_t::_add));
+                        a.emplace_back(e);
+                        b.emplace_back(is_mul);
+                    }
+                }
+                auto a_new = vector2expr(a, vars);
+                auto b_new = vector2expr(b, vars);
+                if (auto *a_bin = a_new.as_ptr<binary_op_t>())
+                    if ((a_bin->op_kind == op_kind_t::_add) && is_var(a_bin->b)
+                            && is_cmp_op(k_raw) && is_shuffle_const(b_new))
+                        for (auto &v : vars)
+                            if (v.second.is_equal(a_bin->b)) {
+                                auto fold = const_fold_non_recursive(
+                                        b_new - v.first);
+                                return binary_op_t::make(negate_cmp_op(k_raw),
+                                        fetch_var(fold), a_bin->a);
+                            }
+                return binary_op_t::make(k_raw, a_new, b_new);
+            }
+
+            size_t num_ints = 0;
+            for (const expr_t &e : expr)
+                num_ints += e.is<int_imm_t>();
+            ir_assert((num_ints == 0) || (num_ints == expr.size()));
+            if (num_ints == expr.size()) {
+                auto offs = shuffle_t::make(expr);
+                if (offs.as<shuffle_t>().is_broadcast()) return offs;
+                return fetch_var(offs);
+            }
+
+            size_t num_bools = 0;
+            for (const expr_t &e : expr)
+                num_bools += e.is<bool_imm_t>();
+            ir_assert((num_bools == 0) || (num_bools == expr.size()));
+            if (num_bools == expr.size()) return shuffle_t::make(expr);
+
+            ir_assert(expr.front().is<var_t>());
+            for (const expr_t &e : expr)
+                ir_assert(e.is_same(expr.front()));
+            return shuffle_t::make_broadcast(expr.front(), int(expr.size()));
+        }
+
+        load_multiply_builder_t &lmb_;
+        bool is_const_;
+        bool is_simd_;
+        bool is_scalar_;
+        bool is_wide_;
+        int size_;
+        expr_t ic_start_;
+        expr_t var_mask_;
+        const expr_t &zp_mask_;
+        stmt_t stmt_;
+    };
+
+    stmt_t maybe_add_src_zps(const view_t &a_view, const view_t &b_view,
+            const multiply_builder_t &mul_builder, int i_buf, int j_buf) {
+        if (!prb_.zp_cfg.do_src_compensation) return mul_builder.stmt();
+        const bool is_runtime = prb_.zp_cfg.is_runtime_src_zero_points;
+        const bool is_scalar = prb_.zp_cfg.is_common_src_zero_point;
+        const bool is_mad = (cfg_.fma_kind() == fma_kind_t::mad);
+        const int channels = utils::rnd_up_pow2(
+                (!is_mad) ? (prb_.is_fwd) ? prb_.ic : prb_.oc : prb_.g);
+        const int c_blk = (channels < 32) ? channels : 32;
+        const int k_blk = ((channels > 4)) ? 32 / c_blk : 1;
+        const int m_blk = cfg_.simd();
+
+        const type_t s_type = is_mad ? a_view.type() : type_t::s32();
+        const type_t i_type = type_t::s32();
+        const type_t d_type = type_t::s32();
+        const int a_stride
+                = s_type.size() * int(a_view.tlayout().blocks()[0].stride);
+        int desc_m = 0, desc_n = 0;
+
+        if (!is_mad) {
+            auto &mapper = gemm_schedule_.bmnk_mapper();
+            auto a_layout = mapper.map_to_bmnk(abc_kind_t::a,
+                    {bmnk_kind_t::m, bmnk_kind_t::k}, a_view.create_vlayout());
+            auto b_layout = mapper.map_to_bmnk(abc_kind_t::b,
+                    {bmnk_kind_t::k, bmnk_kind_t::n}, b_view.create_vlayout());
+            if (mul_builder.do_transpose()) {
+                a_layout = a_layout.transpose();
+                b_layout = b_layout.transpose();
+                std::swap(a_layout, b_layout);
+            }
+            multiply_desc_t desc(a_layout, b_layout, true);
+            desc_m = desc.m();
+            desc_n = desc.n();
+        } else {
+            desc_n = a_view.tlayout().size() / m_blk / a_stride;
+            desc_m = m_blk;
+        }
+        if (zp_mask_.is_empty())
+            zp_mask_ = ir_ctx_.create_tmp_var(type_t::byte_ptr(), "zp_mask");
+        src_zp_mask_info_t masks(*this, m_blk, k_blk, desc_m, desc_n, channels,
+                a_stride, is_mad, a_view, zp_mask_, zp_mask_size_);
+        stmt_t data = masks.stmt();
+
+        const int simd_per_ic = utils::div_up(
+                std::min((!is_scalar) ? channels : 1, 32), m_blk);
+        const std::vector<dim_t> dims
+                = {m_blk * std::min((is_mad) ? 1 : 2, simd_per_ic)};
+        const bool sc_ic = is_scalar || (channels <= 32);
+        expr_t offs = (!sc_ic) ? masks.ic_start() * d_type.size() : 0;
+
+        if (is_runtime && !sc_ic && !cfg_.pipeline().do_unroll()
+                && (cfg_.slm().bufs() > 1)) {
+            auto buf = ir_ctx_.create_tmp_var(type_t::byte_ptr(), "zp_mask");
+            register_buffer(buf, type_t::u32().size(), alloc_kind_t::grf);
+            data = data.append(store_t::make(buf, 0, offs));
+            offs = load_t::make(type_t::u32(), buf, 0);
+        }
+
+        auto get_src_zp_size = [](bool scalar, bool runtime, bool mad, int b) {
+            if (scalar) return (!mad) ? b * 2 : ((runtime) ? b : 0);
+            return ((!mad) ? std::max(b * 2, 32) : 32) + (runtime ? b + b : 0);
+        };
+        const int m_blk_x2 = std::min(m_blk * 2, 16);
+        const int src_zp_size = get_src_zp_size(
+                is_scalar, is_runtime, is_mad, m_blk_x2 * k_blk);
+        if (zp_buf_.is_empty())
+            zp_buf_ = ir_ctx_.create_tmp_var(type_t::byte_ptr(), "zp_buf");
+        zp_buf_size_ = std::max(zp_buf_size_, src_zp_size * d_type.size());
+
+        for (int i = (is_runtime) ? 0 : std::numeric_limits<int>::max();
+                i < m_blk * simd_per_ic; i += dims[0]) {
+            const int b = i * d_type.size();
+            view_t zpv(layout_t(d_type, 0, dims));
+            auto read = make_access_builder(ir_ctx_, zpv,
+                    kernel_info_.find_arg("src_zero_points")[offs + b],
+                    zp_buf_[b], send_op_t::load, send_address_t::a64);
+            data = data.append(read.stmt());
+        }
+
+        if (is_mad) {
+            // TODO: for now, only b-blocking (per G) of the MAD loop is ready;
+            //       please implement n-blocking (per OC) as well!
+            ir_assert(a_view.tlayout().size() % a_stride == 0);
+            ir_assert(masks.is_simd());
+
+            std::vector<stmt_t> loop(std::max(1, 32 / m_blk));
+            for (int a_off = 0; a_off < a_view.tlayout().size();
+                    a_off += m_blk * a_stride) {
+                int iter = (a_off / m_blk / a_stride) % loop.size();
+                type_t sv_type(s_type.kind(), m_blk);
+                type_t b_type(type_t::s32().kind(), (!is_scalar) ? m_blk : 1);
+                auto a = load_t::make(sv_type, a_buf_, a_off, a_stride);
+                auto b_off
+                        = (!is_scalar && (channels > m_blk)) ? iter * m_blk : 0;
+                auto b = (is_runtime) // '4'-s mean '(|i32| / |i16|) * |i16|'
+                        ? load_t::make(b_type, zp_buf_, b_off * 4, 4)
+                        : prb_.zp_cfg.common_src_zero_point;
+                auto mask = masks.gen_mask(
+                        (utils::div_up(k_blk, 2)) * a_off / m_blk / a_stride);
+                auto mad = (masks.is_bool())
+                        ? binary_op_t::make(op_kind_t::_sub, a, b, sv_type)
+                        : ternary_op_t::make(
+                                op_kind_t::_mad, a, mask, b, sv_type);
+                loop[iter] = loop[iter].append(store_t::make(a_buf_, a_off, mad,
+                        a_stride, (masks.is_bool()) ? mask : expr_t()));
+            }
+            for (size_t i = 1; i < loop.size(); i++)
+                loop[0] = loop[0].append(loop[i]);
+            return data.append(masks.maybe_gen_mask_let(
+                    loop[0].append(mul_builder.stmt())));
+        }
+
+        if (is_scalar) {
+            // store int8 ones vector for dp4a into unused space in buffer
+            int ones = 0x01010101;
+            data = data.append(store_t::make(zp_buf_, 4, ones));
+            data = data.append(store_t::make(zp_buf_, 8, expr_t(0)));
+        }
+        std::vector<stmt_t> parts;
+
+        auto wide_scalar = [m_blk](const expr_t &a, const expr_t &b, int blk) {
+            if (blk == m_blk) return shuffle_t::make_broadcast(a, m_blk);
+            std::vector<int> index(blk, 1);
+            for (int i = 0; i < m_blk; i++)
+                index[i] = 0;
+            return shuffle_t::make(std::vector<expr_t> {a, b}, index);
+        };
+        auto wide_vector = [m_blk, i_type](const expr_t &a, int blk) {
+            if (blk == m_blk)
+                return load_t::make(type_t(i_type.kind(), m_blk), a, 0);
+            std::vector<expr_t> vec(m_blk);
+            std::vector<int> index(blk);
+            for (int i = 0; i < m_blk; i++) {
+                vec[i] = load_t::make(i_type, a, i * i_type.size());
+                index[i + m_blk] = index[i] = i;
+            }
+            return shuffle_t::make(vec, index);
+        };
+        std::vector<expr_t> acc;
+        for (int i = 1; i <= 2 * k_blk; i++)
+            acc.emplace_back(
+                    zp_buf_[(src_zp_size
+                                    - utils::div_up(
+                                              i, m_blk != m_blk_x2 ? 1 : 2)
+                                            * m_blk)
+                            * d_type.size()]);
+        for (int i_m = 0; i_m < desc_m; i_m += m_blk) {
+            const int blk
+                    = (masks.is_simd() || masks.is_scalar()) ? m_blk_x2 : m_blk;
+            for (int i = 0; i < k_blk; i++) {
+                type_t vi(i_type.kind(), m_blk_x2);
+                for (int i_k = i * (c_blk / 4); i_k
+                        < ((channels > 4) ? (c_blk + i * c_blk) / 4 : prb_.kw);
+                        i_k += m_blk_x2 / m_blk) {
+                    if (is_scalar) {
+                        const int szp_off = 4;
+                        auto b0 = load_t::make(d_type, zp_buf_, szp_off);
+                        auto b = b0;
+                        auto c = load_t::make(vi, b_buf_,
+                                (i_m * (32 / 4) + i_k * m_blk) * d_type.size());
+                        std::swap(b, c);
+                        auto a = (i_k != i * (c_blk / 4))
+                                ? load_t::make(vi, acc[i * 2 + 1], 0)
+                                : expr_t(0);
+                        parts.emplace_back(store_t::make(acc[i * 2 + 1], 0,
+                                ternary_op_t::make(
+                                        op_kind_t::_dp4a, a, b, c, vi)));
+                    } else {
+                        const int szp_off = (i_k * 4) % c_blk;
+                        if (i_k == i * (c_blk / 4)) {
+                            parts.emplace_back(store_t::make(acc[i * 2 + 1], 0,
+                                    shuffle_t::make_broadcast(
+                                            expr_t(0), vi.elems())));
+                        }
+                        for (int i_b = 0; i_b < 4; i_b++) {
+                            auto b0 = load_t::make(d_type, zp_buf_,
+                                    (szp_off + i_b) * d_type.size());
+                            auto b1 = load_t::make(d_type, zp_buf_,
+                                    (szp_off + i_b + 4) * d_type.size());
+                            auto b = wide_scalar(b0, b1, m_blk_x2);
+                            auto b_tmp_offset = (src_zp_size - m_blk_x2 * k_blk
+                                                        - (m_blk_x2 * k_blk))
+                                    * d_type.size();
+                            parts.emplace_back(store_t::make(zp_buf_,
+                                    b_tmp_offset,
+                                    cast_t::make(type_t::s16(m_blk_x2),
+                                            load_t::make(type_t::s8(m_blk_x2),
+                                                    b_buf_,
+                                                    (i_m * (32 / 4)
+                                                            + i_k * m_blk)
+                                                                    * d_type.size()
+                                                            + i_b,
+                                                    4)),
+                                    4));
+                            auto c = load_t::make(type_t::s16(m_blk_x2),
+                                    zp_buf_, b_tmp_offset, 4);
+                            auto a = load_t::make(vi, acc[i * 2 + 1], 0);
+                            parts.emplace_back(store_t::make(acc[i * 2 + 1], 0,
+                                    ternary_op_t::make(
+                                            op_kind_t::_mad, a, b, c, vi)));
+                        }
+                    }
+                }
+
+                auto apply_scalar = [&]() {
+                    type_t vs32(i_type.kind(), m_blk);
+                    auto zp0 = load_t::make(d_type, zp_buf_, 0);
+                    auto b = load_t::make(vs32, acc[i * 2 + 1], 0);
+                    auto zero
+                            = load_t::make(d_type, zp_buf_, 2 * d_type.size());
+                    parts.emplace_back(store_t::make(acc[i * 2 + 1], 0,
+                            b * shuffle_t::make_broadcast(zp0, vs32.elems())));
+                };
+                // XXX: workaround synchronization issue
+                if (!is_scalar && !cfg_.slm())
+                    parts.emplace_back(funcs::barrier());
+
+                if (is_scalar && m_blk == m_blk_x2) apply_scalar();
+                if (m_blk_x2 != m_blk) {
+                    type_t vi(i_type.kind(), m_blk);
+                    auto a = load_t::make(vi, acc[i * 2 + 1], 0);
+                    auto b = load_t::make(vi, acc[i * 2 + 0], 0);
+                    parts.emplace_back(store_t::make(acc[i * 2 + 1], 0, a + b));
+                    if (is_scalar) apply_scalar();
+                    if (!masks.is_bool() && (blk != m_blk))
+                        parts.emplace_back(store_t::make(acc[i * 2 + 0], 0, a));
+                }
+            }
+            for (int i_n = 0; i_n < desc_n; i_n += blk / m_blk) {
+                int off_n = i_m / m_blk * desc_n + i_n;
+                const int ij_buf = i_buf * cfg_.subtiles().b() + j_buf;
+                auto dst = c_buf_ + off_n * m_blk * d_type.size()
+                        + ij_buf * mul_builder.c_layout().size();
+                type_t vi(i_type.kind(), blk);
+                auto a = load_t::make(vi, dst, 0);
+                for (int i = 0; i < k_blk; i++) {
+                    auto mask = masks.gen_mask(off_n * k_blk + i * blk / m_blk);
+                    if (!masks.is_bool()) {
+                        auto b = load_t::make(vi, acc[i * 2 + 1], 0);
+                        auto mad = ternary_op_t::make(
+                                op_kind_t::_mad, a, b, mask);
+                        parts.emplace_back(store_t::make(dst, 0, mad));
+                    } else {
+                        auto b = wide_vector(acc[i * 2 + 1], blk);
+                        auto sub = binary_op_t::make(op_kind_t::_sub, a, b);
+                        parts.emplace_back(store_t::make(
+                                dst, 0, sub, store_t::default_stride, mask));
+                    }
+                }
+            }
+        }
+        // Stick the compensations between DPASes for better GPU utilization
+        auto raw_dpas = flatten_statements(mul_builder.stmt());
+        std::vector<stmt_t> dpas;
+        stmt_t full;
+        expr_t src1;
+        for (auto &r : raw_dpas) {
+            ir_assert(is_func_call<dpas_t>(r));
+            auto &this_src1 = dpas_t::arg_src1(r);
+            if (this_src1.is_equal(src1)) {
+                dpas.back() = dpas.back().append(r);
+            } else {
+                src1 = this_src1;
+                dpas.emplace_back(r);
+            }
+        }
+        ir_assert(parts.size() % dpas.size() == 0);
+        const int loop_size = int(parts.size()) / int(dpas.size());
+        for (int i = 0; i < int(dpas.size()); i++) {
+            full = full.append(dpas[i]);
+            const auto k = (i + int(dpas.size()) / 2) % int(dpas.size());
+            for (int j = k * loop_size; j < (k + 1) * loop_size; j++)
+                full = full.append(parts[j]);
+        }
+        return data.append(masks.maybe_gen_mask_let(full));
+    }
+
+    void build_subtile(int i, int j) {
+        bool is_first = (i == 0 && j == 0);
+
+        stmt_t ab_s2r_load;
+        stmt_t ab_g2r_load;
+        if (!a_subtiles_[i].is_loaded()) {
+            ab_s2r_load = ab_s2r_load.append(a_subtiles_[i].s2r_load());
+            ab_g2r_load = ab_g2r_load.append(a_subtiles_[i].g2r_load());
+            a_subtiles_[i].set_loaded();
+        }
+        if (!b_subtiles_[j].is_loaded()) {
+            ab_s2r_load = ab_s2r_load.append(b_subtiles_[j].s2r_load());
+            ab_g2r_load = ab_g2r_load.append(b_subtiles_[j].g2r_load());
+            b_subtiles_[j].set_loaded();
+        }
+        load_mul_stmt_ = load_mul_stmt_.append(
+                stmt_group_t::make(stmt_label_t::g2r_load(i + j), ab_g2r_load));
+        load_mul_stmt_ = load_mul_stmt_.append(
+                stmt_group_t::make(stmt_label_t::s2r_load(i + j), ab_s2r_load));
+
+        auto &a_i_view = a_subtiles_[i].reg_view();
+        auto &b_j_view = b_subtiles_[j].reg_view();
+
+        // Multiply C_i_j += A_i x B_j in GEMM notation.
+        multiply_builder_t mul_builder(cfg_, gemm_schedule_.bmnk_mapper(),
+                a_i_view, b_j_view, a_buf_, b_buf_, c_buf_[c_buf_off_]);
+        c_subtile_layout_ = mul_builder.c_layout();
+
+        auto mul_total
+                = maybe_add_src_zps(a_i_view, b_j_view, mul_builder, i, j);
+
+        c_buf_off_ += c_subtile_layout_.size();
+        ir_trace() << "Multiply (" << i << ", " << j << "):\n"
+                   << mul_total.str() << std::endl;
+
+        load_mul_stmt_ = load_mul_stmt_.append(
+                stmt_group_t::make(stmt_label_t::mul(i + j), mul_total));
+
+        if (!is_first) {
+            ir_assert(mul_builder.c_layout() == c_subtile_layout_)
+                    << "Sub-tile layouts must be equal.";
+            return;
+        }
+
+        register_buffer(
+                a_buf_, a_subtiles_[i].reg_buf_size(), alloc_kind_t::grf);
+        register_buffer(
+                b_buf_, b_subtiles_[j].reg_buf_size(), alloc_kind_t::grf);
+    }
+    void register_buffer(const stmt_t &alloc) {
+        ir_assert(alloc.is<alloc_t>());
+        allocs_.push_back(alloc);
+    }
+
+    void register_buffer(const expr_t &buf, int size, alloc_kind_t kind,
+            const alloc_attr_t &attr = {}) {
+        register_buffer(alloc_t::make(buf, size, kind, attr));
+    }
+
+    const conv_problem_t &prb_;
+    const conv_config_t &cfg_;
+    ir_context_t &ir_ctx_;
+    const gemm_schedule_t &gemm_schedule_;
+    const fma_helper_t &fma_helper_;
+    b_reduce_context_t &b_reduce_ctx_;
+
+    expr_t ap_buf_;
+    expr_t a_slm_buf_;
+
+    expr_t bp_buf_;
+    expr_t b_slm_buf_;
+
+    expr_t zp_buf_;
+    int zp_buf_size_ = 0;
+
+    expr_t zp_mask_;
+    int zp_mask_size_ = 0;
+
+    layout_t c_reg_layout_;
+
+    expr_t ab_tmp_buf_;
+    expr_t a_buf_;
+    expr_t b_buf_;
+    expr_t c_buf_;
+
+    // Per-thread views to multiply.
+    view_t a_thr_view_;
+    view_t b_thr_view_;
+
+    // Sub-tile indices.
+    expr_t a_idx_;
+    expr_t b_idx_;
+
+    // Sub-tile views.
+    view_t a_i_view_;
+    view_t b_j_view_;
+
+    tensor_t a_i_tile_;
+    tensor_t b_j_tile_;
+
+    std::vector<subtile_info_t> a_subtiles_;
+    std::vector<subtile_info_t> b_subtiles_;
+
+    std::vector<block_t> a_i_outer_blocks_;
+    std::vector<block_t> b_j_outer_blocks_;
+
+    std::vector<stmt_t> allocs_;
+
+    stmt_t load_mul_stmt_;
+
+    int c_buf_off_ = 0;
+    layout_t c_subtile_layout_;
+
+    const kernel_info_t &kernel_info_;
+};
 
 class compute_builder_t {
 public:
     compute_builder_t(const conv_config_t &cfg, ir_context_t &ir_ctx,
             const kernel_info_t &kernel_info)
         : cfg_(cfg)
-        , plan_(cfg_.plan())
         , ir_ctx_(ir_ctx)
-        , kernel_info_(kernel_info)
-        , buf_mgr_(ir_ctx) {
-        if (plan_.slm.has_a())
-            (void)buf_mgr_.get("a_slm", plan_.slm.a_layout.size());
-        if (plan_.slm.has_b())
-            (void)buf_mgr_.get("b_slm", plan_.slm.b_layout.size());
+        , b_reduce_ctx_(ir_ctx, cfg)
+        , g2s_ctx_(ir_ctx)
+        , fma_helper_(cfg.simd(), cfg.fma_kind(), cfg.prb().a_data_type,
+                  cfg.prb().b_data_type, cfg.allow_a_grf_reorder(),
+                  cfg.allow_b_grf_reorder(), !cfg.prb().is_dw)
+        , kernel_info_(kernel_info) {}
+
+    int ab_slm_size() const { return ab_slm_size_; }
+
+    const stmt_t &c_zero_out_stmt() const { return c_zero_out_stmt_; }
+    const stmt_t &b_reduced_zero_out_stmt() const {
+        return b_reduced_zero_out_stmt_;
     }
 
-    // Setters for original AP/BP/CP buffers (P - problem notation).
-    void set_ap_buf(const expr_t &buf) { ap_buf_ = buf; }
-    void set_bp_buf(const expr_t &buf) { bp_buf_ = buf; }
-    void set_cp_buf(const expr_t &buf) { cp_buf_ = buf; }
-    void set_b_reduce_buf(const expr_t &buf) { b_reduce_buf_ = buf; }
-
-    int ab_slm_size() const { return plan_.slm.slm_size(); }
-
     stmt_t zero_out_stmt() const {
-        auto c_entry = buf_mgr_.find("c");
-        auto ret = stmt_group_t::make(stmt_label_t::c_zero_out(),
-                funcs::zero_out(c_entry.buf, c_entry.size));
-        auto b_reduce_entry = buf_mgr_.find("b_reduce", /*allow_empty=*/true);
-        if (!b_reduce_entry.is_empty()) {
-            ret = ret.append(
-                    funcs::zero_out(b_reduce_entry.buf, b_reduce_entry.size));
-        }
+        stmt_t ret;
+        ret = ret.append(c_zero_out_stmt());
+        ret = ret.append(b_reduced_zero_out_stmt());
         return ret;
     }
 
@@ -223,397 +1960,541 @@ public:
                     stmt_label_t::g2s_store(), g2s_store_stmt_));
             stmt = stmt.append(funcs::barrier());
         }
-        stmt = stmt.append(x2r_mul_stmt_);
+        stmt = stmt.append(load_mul_stmt_);
         return stmt;
     }
 
+    const stmt_t &c_store_stmt() const { return c_store_stmt_; }
+    const stmt_t &b_reduced_store_stmt() const { return b_reduced_store_stmt_; }
+
     stmt_t inject_compute_alloc_stmts(const stmt_t &stmt) const {
-        return buf_mgr_.inject_allocs(stmt, is_compute_alloc_buf);
+        return jit::inject_alloc_stmts(stmt, compute_allocs_);
     }
 
     stmt_t inject_out_alloc_stmts(const stmt_t &stmt) const {
-        return buf_mgr_.inject_allocs(stmt, is_out_alloc_buf);
+        return jit::inject_alloc_stmts(stmt, out_allocs_);
     }
 
-    const stmt_t &c_store_stmt() const { return c_store_stmt_; }
+    stmt_t inject_let_stmts(const stmt_t &stmt) const {
+        return jit::inject_let_stmts(stmt, g2s_ctx_.grid_idx_lets);
+    }
 
-    const stmt_t &b_reduced_store_stmt() const { return b_reduce_store_stmt_; }
+    void set_gemm_schedule(const gemm_schedule_t &gemm_schedule) {
+        gemm_schedule_ = gemm_schedule;
+    }
+
+    // Setters for original AP/BP/CP buffers (P - problem notation).
+    void set_ap_buf(const expr_t &buf) { ap_buf_ = buf; }
+    void set_bp_buf(const expr_t &buf) { bp_buf_ = buf; }
+    void set_cp_buf(const expr_t &buf) { cp_buf_ = buf; }
+    void set_b_reduced_mem_buf(const expr_t &buf) {
+        b_reduce_ctx_.set_b_reduced_mem_buf(buf);
+    }
+
+    void set_b_reduced_view(const view_t &v) {
+        b_reduce_ctx_.set_b_reduced_view(v);
+    }
+
+    void set_post_op_context(const post_op_context_t &post_op_ctx) {
+        post_op_ctx_ = post_op_ctx;
+    }
+
+    void set_reduce_condition(const expr_t &cond) {
+        b_reduce_ctx_.set_reduce_condition(cond);
+    }
 
     void build() {
-        build_g2s();
-        build_prefetch();
-        build_x2r_mul();
-        build_c_store();
-        build_b_reduce_store();
+        // Initialize SLM buffers.
+        expr_t a_slm_buf = make_buffer("a_slm");
+        expr_t b_slm_buf = make_buffer("b_slm");
 
-        // Replace dpas by dpasw when applicable.
-        if (cfg_.fma_kind() == fma_kind_t::dpasw) {
-            alloc_updater_t alloc_updater;
-            inject_dpasw(ir_ctx_.hw(), x2r_mul_stmt_, buf_mgr_.get("c"),
-                    c_store_stmt_, alloc_updater,
-                    plan_.gemm_schedule.tg_grid().idx(0));
-            alloc_updater.update(buf_mgr_);
+        view_t ap_gmem_view = gemm_schedule_.a_tg_view();
+        view_t bp_gmem_view = gemm_schedule_.b_tg_view();
+
+        // Views to multiply by a thread group (either GMEM or SLM).
+        view_t ap_x_view;
+        view_t bp_x_view;
+        prepare_gmem_to_slm("A", cfg_.slm().a(), gemm_schedule_.a_tg_tile(),
+                ap_gmem_view, ap_buf_, a_slm_buf, ap_x_view, g2s_ctx_);
+        prepare_gmem_to_slm("B", cfg_.slm().b(), gemm_schedule_.b_tg_tile(),
+                bp_gmem_view, bp_buf_, b_slm_buf, bp_x_view, g2s_ctx_);
+        prepare_prefetch("A", cfg_.prefetch(), ap_gmem_view, ap_buf_);
+        prepare_prefetch("B", cfg_.prefetch(), bp_gmem_view, bp_buf_);
+
+        if (ap_x_view.is_empty()) ap_x_view = ap_gmem_view;
+        if (bp_x_view.is_empty()) bp_x_view = bp_gmem_view;
+
+        for (auto &bi : g2s_ctx_.bufs) {
+            register_compute_buffer(bi.buf, bi.size, alloc_kind_t::grf);
         }
 
-        // Assign {Atomic} for dpas(w) when applicable.
-        x2r_mul_stmt_ = inject_atomic(x2r_mul_stmt_);
-    }
+        load_multiply_builder_t load_mul_builder(cfg_, ir_ctx_, gemm_schedule_,
+                fma_helper_, b_reduce_ctx_, ap_buf_, a_slm_buf, bp_buf_,
+                b_slm_buf, ap_x_view, bp_x_view, kernel_info_);
 
-private:
-    static const expr_t &get_buffer(const stmt_t &s) {
-        auto &alloc = s.as<alloc_t>();
-        return alloc.buf;
-    }
+        load_mul_stmt_ = load_mul_builder.load_mul_stmt();
+        compute_allocs_.insert(compute_allocs_.end(),
+                load_mul_builder.allocs().begin(),
+                load_mul_builder.allocs().end());
 
-    static bool is_compute_alloc_buf(const expr_t &buf) {
-        return !is_out_alloc_buf(buf);
-    }
+        auto c_buf = load_mul_builder.c_buf();
+        int c_size = load_mul_builder.c_reg_layout().size();
+        int c_size_grf_rounded = utils::rnd_up(c_size, ir_ctx_.grf_size());
+        register_out_buffer(c_buf, c_size_grf_rounded, alloc_kind_t::grf);
 
-    static bool is_out_alloc_buf(const expr_t &buf) {
-        auto &buf_name = buf.as<var_t>().name;
-        return utils::one_of(buf_name, "b_reduce", "c");
-    }
+        auto c_thr_reg_layout = load_mul_builder.c_reg_layout();
+        auto thr_tile = gemm_schedule_.c_thr_tile(/*is_relative=*/false);
 
-    void build_g2s() {
-        auto &slm = plan_.slm;
-        if (slm.has_a()) {
-            build_g2s_x("a", ap_buf_, buf_mgr_.get("a_slm"), slm.a_g2s_load,
-                    layout_t(), reduce_plan_t(), slm.a_reorder, slm.a_g2s_store,
-                    slm.a_grid);
-        }
-        if (slm.has_b()) {
-            build_g2s_x("b", bp_buf_, buf_mgr_.get("b_slm"), slm.b_g2s_load,
-                    slm.b_reduce_layout, slm.b_reduce, slm.b_reorder,
-                    slm.b_g2s_store, slm.b_grid);
-        }
-    }
-
-    void build_g2s_x(const std::string &prefix, const expr_t &mem_buf,
-            const expr_t &slm_buf, const send_plan_t &g2s_load,
-            const layout_t &reduce_layout, const reduce_plan_t &g2s_reduce,
-            const reorder_plan_t &g2s_reorder, const send_plan_t &g2s_store,
-            const grid_info_t &grid) {
-        auto g2s_buf = buf_mgr_.get(prefix + "_g2s", g2s_load.reg_buf_size());
-        auto load = g2s_load.create_stmt(mem_buf, g2s_buf);
-        auto reduce_buf = g2s_reduce
-                ? buf_mgr_.get("b_reduce", g2s_reduce.dst_buf_size())
-                : expr_t();
-        auto store_buf = g2s_reorder
-                ? buf_mgr_.get("g2s_tmp", g2s_store.reg_buf_size())
-                : g2s_buf;
-        if (store_buf.is_same(g2s_buf)) {
-            g2s_buf = buf_mgr_.get(prefix + "_g2s", g2s_store.reg_buf_size());
-        }
-        if (g2s_reorder) {
-            g2s_buf = buf_mgr_.get(prefix + "_g2s", g2s_reorder.src.size());
-        }
-        auto reduce = g2s_reduce.create_stmt(g2s_buf, reduce_buf);
-        auto reorder = g2s_reorder.create_stmt(g2s_buf, store_buf);
-        auto store = g2s_store.create_stmt(slm_buf, store_buf);
-        store = reduce.append(reorder).append(store);
-        load = add_grid_guard(load, cfg_.thread_group_grid(), grid);
-        store = add_grid_guard(store, cfg_.thread_group_grid(), grid);
-        g2s_load_stmt_ = g2s_load_stmt_.append(load);
-        g2s_store_stmt_ = g2s_store_stmt_.append(store);
-    }
-
-    void build_prefetch() {
-        auto &prefetch = plan_.prefetch;
-        if (prefetch.has_a()) {
-            build_prefetch_x(ap_buf_, prefetch.a_prefetch);
-        }
-        if (prefetch.has_b()) {
-            build_prefetch_x(bp_buf_, prefetch.b_prefetch);
-        }
-    }
-
-    void build_prefetch_x(const expr_t &mem_buf, const send_plan_t &prefetch) {
-        prefetch_stmt_ = prefetch_stmt_.append(
-                prefetch.create_stmt(mem_buf, expr_t()));
-    }
-
-    void build_x2r_mul() {
-        auto &x2r = plan_.x2r;
-        auto &fma = plan_.fma;
-        ir_assert(x2r.split_abc == fma.split_abc);
-        ir_assert(x2r.split_factor == fma.split_factor);
-        for (int i = 0; i < x2r.split_factor; i++) {
-            build_x2r(i);
-            stmt_t mul_stmt;
-            build_zp_init(i, mul_stmt);
-            build_mul(i, mul_stmt);
-            build_zp_apply(i, mul_stmt);
-            mul_stmt = stmt_group_t::make(stmt_label_t::mul(i), mul_stmt);
-            x2r_mul_stmt_ = x2r_mul_stmt_.append(mul_stmt);
-        }
-    }
-
-    void build_x2r(int subtile_idx) {
-        auto &x2r = plan_.x2r;
-        auto ax_buf = plan_.slm.has_a() ? buf_mgr_.get("a_slm") : ap_buf_;
-        auto bx_buf = plan_.slm.has_b() ? buf_mgr_.get("b_slm") : bp_buf_;
-        stmt_t g2r_load_stmt;
-        stmt_t s2r_load_stmt;
-        build_x2r_x("a", ax_buf, subtile_idx, x2r.a_load, reduce_plan_t(),
-                x2r.a_reorder, x2r.a_buf_size(), g2r_load_stmt, s2r_load_stmt);
-        build_x2r_x("b", bx_buf, subtile_idx, x2r.b_load, x2r.b_reduce,
-                x2r.b_reorder, x2r.b_buf_size(), g2r_load_stmt, s2r_load_stmt);
-        g2r_load_stmt = stmt_group_t::make(
-                stmt_label_t::g2r_load(subtile_idx), g2r_load_stmt);
-        s2r_load_stmt = stmt_group_t::make(
-                stmt_label_t::s2r_load(subtile_idx), s2r_load_stmt);
-        x2r_mul_stmt_ = x2r_mul_stmt_.append(g2r_load_stmt);
-        x2r_mul_stmt_ = x2r_mul_stmt_.append(s2r_load_stmt);
-    }
-
-    void build_zp_init(int subtile_idx, stmt_t &mul_stmt) {
-        auto &zp = plan_.zp;
-        if (!zp) return;
-
-        auto zp_mem_buf = kernel_info_.find_arg("src_zero_points");
-        auto zp_buf = buf_mgr_.get("src_zp", zp.load_reg_buf_size());
-        auto wei_buf = buf_mgr_.get("b");
-        auto zp_mask_buf = buf_mgr_.get("zp_mask", zp.mask_reg_buf_size());
-        auto zp_comp_buf = buf_mgr_.get("zp_comp", zp.comp_reg_buf_size());
-        auto load = zp.load_create_stmt(zp_mem_buf, zp_buf, subtile_idx);
-        auto zp_mask_init = zp.mask_init_create_stmt(zp_mask_buf, subtile_idx);
-        auto zp_comp_init = zp.comp_init_create_stmt(
-                buf_mgr_, zp_buf, wei_buf, zp_comp_buf, subtile_idx);
-        mul_stmt = mul_stmt.append(load);
-        mul_stmt = mul_stmt.append(zp_mask_init);
-        mul_stmt = mul_stmt.append(zp_comp_init);
-    }
-
-    void build_zp_apply(int subtile_idx, stmt_t &mul_stmt) {
-        auto &zp = plan_.zp;
-        if (!zp) return;
-
-        auto c_buf = buf_mgr_.get("c");
-        auto zp_comp_buf = buf_mgr_.get("zp_comp");
-        auto zp_mask_buf = buf_mgr_.get("zp_mask");
-        auto zp_comp_apply = zp.comp_apply_create_stmt(
-                zp_comp_buf, zp_mask_buf, c_buf, subtile_idx);
-        mul_stmt = mul_stmt.append(zp_comp_apply);
-    }
-
-    void build_x2r_x(const std::string &prefix, const expr_t &x_buf,
-            int subtile_idx, const send_plan_t &x2r_load,
-            const reduce_plan_t &x2r_reduce, const reorder_plan_t &x2r_reorder,
-            int buf_size, stmt_t &g2r_load_stmt, stmt_t &s2r_load_stmt) {
-        if (subtile_idx > 0 && x2r_load.split_factor() == 1) return;
-        auto reg_buf = buf_mgr_.get(prefix, buf_size);
-        auto load_buf = x2r_reorder ? buf_mgr_.get("x2r_tmp",
-                                std::max(x2r_load.reg_buf_size(),
-                                        (int)x2r_reorder.src.size()))
-                                    : reg_buf;
-        if (load_buf.is_same(reg_buf)) {
-            reg_buf = buf_mgr_.get(prefix, x2r_load.reg_buf_size());
-        }
-        auto reduce_buf = x2r_reduce
-                ? buf_mgr_.get("b_reduce", x2r_reduce.dst_buf_size())
-                : expr_t();
-        auto load = x2r_load.create_stmt(x_buf, load_buf, subtile_idx);
-        auto reduce = x2r_reduce.create_stmt(load_buf, reduce_buf);
-        auto reorder = x2r_reorder.create_stmt(load_buf, reg_buf);
-        auto &load_stmt = x2r_load.send_params().is_slm() ? s2r_load_stmt
-                                                          : g2r_load_stmt;
-        load_stmt = load_stmt.append(load);
-        load_stmt = load_stmt.append(reduce);
-        load_stmt = load_stmt.append(reorder);
-    }
-
-    void build_mul(int subtile_idx, stmt_t &mul_stmt) {
-        auto &fma = plan_.fma;
-        auto &a_layout = fma.a_layout;
-        auto &b_layout = fma.b_layout;
-        auto &c_layout = fma.c_layout;
-        auto a_buf = buf_mgr_.get("a");
-        auto b_buf = buf_mgr_.get("b");
-        auto c_buf = buf_mgr_.get("c", c_layout.size());
-        int b0 = fma.bmnk_start_idx(bmnk_kind_t::b, subtile_idx);
-        int b1 = fma.bmnk_stop_idx(bmnk_kind_t::b, subtile_idx);
-        int m0 = fma.bmnk_start_idx(bmnk_kind_t::m, subtile_idx);
-        int m1 = fma.bmnk_stop_idx(bmnk_kind_t::m, subtile_idx);
-        int n0 = fma.bmnk_start_idx(bmnk_kind_t::n, subtile_idx);
-        int n1 = fma.bmnk_stop_idx(bmnk_kind_t::n, subtile_idx);
-        int k0 = fma.bmnk_start_idx(bmnk_kind_t::k, subtile_idx);
-        int k1 = fma.bmnk_stop_idx(bmnk_kind_t::k, subtile_idx);
-
-        std::vector<int> a_idx(3);
-        std::vector<int> b_idx(3);
-        std::vector<int> c_idx(3);
-
-        auto fma_funcs = create_fma_funcs(fma);
-
-        stmt_t stmt;
-        for (int b = b0; b < b1; b += fma.b_blk) {
-            a_idx[0] = b_idx[0] = c_idx[0] = b;
-            for (int k = k0; k < k1; k += fma.k_blk) {
-                a_idx[2] = b_idx[1] = k;
-                for (int n = n0; n < n1; n += fma.n_blk) {
-                    b_idx[2] = c_idx[2] = n;
-                    for (int m = m0; m < m1; m += fma.m_blk) {
-                        a_idx[1] = c_idx[1] = m;
-                        int a_off = a_layout.offset_in_bytes(a_idx);
-                        int b_off = b_layout.offset_in_bytes(b_idx);
-                        int c_off = c_layout.offset_in_bytes(c_idx);
-                        a_off = a_off % fma.a_buf_size();
-                        b_off = b_off % fma.b_buf_size();
-                        stmt = stmt.append(create_fma_block(fma_funcs,
-                                a_buf[a_off], b_buf[b_off], c_buf[c_off]));
-                    }
-                }
-            }
-        }
-        mul_stmt = mul_stmt.append(stmt);
-    }
-
-    void build_c_store() {
-        auto &gemm_schedule = plan_.gemm_schedule;
-        conv_post_op_view_mapper_t view_mapper(
-                gemm_schedule, cfg_.prb(), cfg_.fuse_spatial());
-        post_op_context_t post_op_ctx(*cfg_.prb().attr, cfg_.zp_cfg(),
-                gemm_schedule, kernel_info_, *cfg_.prb().conv_pd->dst_md(),
-                cfg_.prb().c_md(), view_mapper);
-        auto c_buf = buf_mgr_.find("c").buf;
-        auto c_thr_reg_layout = plan_.fma.c_prb_layout;
-        auto thr_tile = gemm_schedule.c_thr_tile(/*is_relative=*/false);
-        expr_t reduce_cond;
-        if (gemm_schedule.with_thread_group_k_slicing()) {
+        auto reduce_cond = expr_t();
+        if (gemm_schedule_.with_thread_group_k_slicing()) {
             slm_reduce_builder_t slm_reduce_builder(ir_ctx_,
-                    gemm_schedule.tg_grid(), c_buf, c_thr_reg_layout, thr_tile);
+                    gemm_schedule_.tg_grid(), c_buf, c_thr_reg_layout,
+                    thr_tile);
             c_store_stmt_ = c_store_stmt_.append(slm_reduce_builder.stmt());
             c_thr_reg_layout = slm_reduce_builder.reg_layout();
             thr_tile = slm_reduce_builder.thr_tile();
             reduce_cond = slm_reduce_builder.reduce_cond();
         }
 
-        // Always perform reorder when dpasw is used. This is to ensure
-        // that C is properly restored and permuted after dpasw.
-        bool force_c_reorder = cfg_.fma_kind() == fma_kind_t::dpasw;
+        auto c_thr_mem_view = gemm_schedule_.c_view().create_sub_view(thr_tile);
+        auto c_m2g_stmt = create_epilogue_stmt(cfg_, ir_ctx_, gemm_schedule_,
+                post_op_ctx_, thr_tile, c_thr_mem_view, c_thr_reg_layout,
+                cp_buf_, c_buf);
+        if (!reduce_cond.is_empty())
+            c_m2g_stmt = if_t::make(reduce_cond, c_m2g_stmt);
+        ir_trace() << "C GRF to GMEM store:\n" << c_m2g_stmt << std::endl;
 
-        int c_buf_size = 0;
-        auto stmt = create_epilogue_stmt(cfg_.exec_cfg(), ir_ctx_,
-                gemm_schedule, force_c_reorder, post_op_ctx, thr_tile,
-                c_thr_reg_layout, cp_buf_, c_buf, c_buf_size);
-        (void)buf_mgr_.get("c", c_buf_size);
-        if (!reduce_cond.is_empty()) stmt = if_t::make(reduce_cond, stmt);
-        c_store_stmt_ = c_store_stmt_.append(stmt);
-    }
+        c_zero_out_stmt_ = stmt_group_t::make(stmt_label_t::c_zero_out(),
+                create_zero_out_stmt(ir_ctx_, c_buf, c_size));
+        c_store_stmt_ = c_store_stmt_.append(c_m2g_stmt);
 
-    expr_t get_b_reduce_store_condition() {
-        auto &gemm_schedule = plan_.gemm_schedule;
-        auto &c_view = gemm_schedule.c_view();
-        auto &kd = c_view.vvar("kd");
-        auto &kh = c_view.vvar("kh");
-        auto &kw = c_view.vvar("kw");
-        auto &ic = c_view.vvar("ic");
-        expr_t cond(true);
-        cond &= (kd == 0);
-        cond &= (kh == 0);
-        cond &= (kw == 0);
-        cond &= (ic == 0);
-        loop_kind_t filter = loop_kind_t::kernel_grid;
-        if (!plan_.slm.has_b()) filter = filter | loop_kind_t::tg_grid;
-        cond = gemm_schedule.expand(cond, /*expand_trivial_vars=*/true, filter);
-        if (plan_.slm.has_b()) {
-            cond = add_grid_guard(
-                    cond, cfg_.thread_group_grid(), plan_.slm.b_grid);
+        if (cfg_.reduce_b()) {
+            auto &ctx = b_reduce_ctx_;
+            b_reduced_zero_out_stmt_ = create_zero_out_stmt(
+                    ir_ctx_, ctx.b_reduced_reg_buf(), ctx.b_reduced_size());
+            b_reduced_store_stmt_ = ctx.create_store_stmt(
+                    gemm_schedule_.with_kernel_grid_k_slicing()
+                    || cfg_.slm().b());
+            register_out_buffer(ctx.b_reduced_reg_buf(), ctx.b_reduced_size(),
+                    alloc_kind_t::grf);
         }
-        return cond;
-    }
 
-    void build_b_reduce_store() {
-        auto &gemm_schedule = plan_.gemm_schedule;
-        bool use_atomic
-                = gemm_schedule.with_kernel_grid_k_slicing() || cfg_.slm().b();
-        auto b_reduce_buf = buf_mgr_.find("b_reduce", /*allow_empty=*/true).buf;
-        if (b_reduce_buf.is_empty()) return;
-        auto b_reduce_view
-                = plan_.bia_view.create_sub_view(plan_.b_reduce_tile());
-        auto r2g = make_access_builder(ir_ctx_, b_reduce_view, b_reduce_buf_,
-                b_reduce_buf,
-                use_atomic ? send_op_t::atomic_fadd : send_op_t::store,
-                send_address_t::a64);
-        auto cond = get_b_reduce_store_condition();
-        b_reduce_store_stmt_ = if_t::make(cond, r2g.stmt());
-    }
-
-    std::vector<func_t> create_fma_funcs(const fma_plan_t &fma) const {
-        auto &a = fma.a_layout;
-        auto &b = fma.b_layout;
-        auto &c = fma.c_layout;
-        std::vector<func_t> ret;
-        switch (fma.fma_kind) {
-            case fma_kind_t::mad: {
-                int simd = fma.max_bmn_blk();
-                int a_stride = fma.is_a_broadcast() ? 0 : (int)a.inner_stride();
-                int b_stride = fma.is_b_broadcast() ? 0 : (int)b.inner_stride();
-                auto mad = mad_t::make(ir_ctx_.hw(), c.type(), simd, a.type(),
-                        a_stride, b.type(), b_stride);
-                ret.push_back(mad);
-                break;
+        // Replace DPAS by DPASW when applicable.
+        if (cfg_.fma_kind() == fma_kind_t::dpasw) {
+            alloc_updater_t alloc_updater;
+            inject_dpasw(ir_ctx_.hw(), load_mul_stmt_, c_buf, c_store_stmt_,
+                    alloc_updater, gemm_schedule_.tg_grid().idx(0));
+            for (auto &a : compute_allocs_) {
+                a = alloc_updater.update(a);
             }
-            case fma_kind_t::dp4a:
-            case fma_kind_t::dpas:
-            case fma_kind_t::dpasw: {
-                const int max_rcount = 8;
-                int block_rcount = fma.m_blk;
-                int simd = fma.n_blk;
-                int sdepth
-                        = ir_utils::safe_divide(fma.k_blk * a.type().size(), 4);
-                for (int r = 0; r < block_rcount;) {
-                    int rcount = std::min(max_rcount, block_rcount - r);
-                    auto dpas = dpas_t::make(/*is_dpasw=*/false, simd, sdepth,
-                            rcount, c.type(), b.type(), a.type());
-                    ret.push_back(dpas);
-                    r += rcount;
+            for (auto &a : out_allocs_) {
+                a = alloc_updater.update(a);
+            }
+        }
+
+        // Assign {Atomic} for DPAS(W) when applicable.
+        load_mul_stmt_ = inject_atomic(load_mul_stmt_);
+    }
+
+private:
+    struct buf_info_t {
+        buf_info_t(const std::string &tag, const expr_t &buf)
+            : tag(tag), buf(buf) {}
+
+        std::string tag;
+        expr_t buf;
+        int size = 0;
+    };
+
+    struct g2s_context_t {
+        g2s_context_t(ir_context_t &ir_ctx) : ir_ctx(ir_ctx) {}
+
+        expr_t create_buf(const char *tag, bool force_reuse = false) {
+            if (reuse_buffers || force_reuse) {
+                for (auto &bi : bufs) {
+                    if (bi.tag == tag) return bi.buf;
                 }
-                break;
             }
-            default: ir_error_not_expected();
+            auto buf = ir_ctx.create_tmp_var(type_t::byte_ptr(), tag);
+            bufs.emplace_back(tag, buf);
+            return buf;
         }
-        return ret;
+
+        void set_buf_size(const expr_t &buf, int size) {
+            for (auto &bi : bufs) {
+                if (bi.buf.is_same(buf)) bi.size = std::max(bi.size, size);
+            }
+        }
+
+        expr_t create_tmp_grid_idx() {
+            auto var = ir_ctx.create_tmp_var(type_t::s32(), "idx");
+            tmp_grid_idxs.insert({var, expr_t()});
+            return var;
+        }
+
+        void set_grid_idx_value(const expr_t &idx, const expr_t &value) {
+            auto &old = tmp_grid_idxs[idx];
+            ir_assert(old.is_empty());
+            old = substitute_grid_idx_value(value);
+        }
+
+        expr_t substitute_grid_idx_value(const expr_t &_e) {
+            auto e = _e;
+            auto vars = find_unique_objects<var_t>(e);
+            for (auto &v : vars) {
+                auto it = tmp_grid_idxs.find(v);
+                if (it == tmp_grid_idxs.end()) continue;
+                e = substitute(e, v, it->second);
+            }
+            return e;
+        }
+
+        void register_grid(const grid_info_t &grid) {
+            for (int i = 0; i < grid.ndims(); i++) {
+                auto &idx = grid.idx(i);
+                auto it = tmp_grid_idxs.find(idx);
+                if (it == tmp_grid_idxs.end()) continue;
+                grid_idx_lets.emplace_back(let_t::make(idx, it->second));
+            }
+        }
+
+        ir_context_t &ir_ctx;
+        grid_info_t prev_load_grid;
+        bool reuse_buffers = false;
+        std::vector<buf_info_t> bufs;
+
+        object_map_t<expr_t, expr_t> tmp_grid_idxs;
+        std::vector<stmt_t> grid_idx_lets;
+    };
+
+    void register_compute_buffer(const expr_t &buf, int size, alloc_kind_t kind,
+            const alloc_attr_t &attr = {}) {
+        compute_allocs_.push_back(alloc_t::make(buf, size, kind, attr));
     }
 
-    stmt_t create_fma_block(const std::vector<func_t> &fmas, const expr_t &a,
-            const expr_t &b, const expr_t &c) const {
-        bool is_dpas = fmas[0].is<dpas_t>();
-        auto src1 = a;
-        auto src2 = b;
-        auto dst = c;
-        if (is_dpas) std::swap(src1, src2);
-        if (!is_dpas) ir_assert(fmas.size() == 1);
-        stmt_t ret;
-        for (auto &f : fmas) {
-            ret = ret.append(f.call({dst, dst, src1, src2}));
-            auto *dpas = f.as_ptr<dpas_t>();
-            if (is_dpas) {
-                src2 += dpas->src2_size();
-                dst += dpas->dst_size();
+    void register_out_buffer(const expr_t &buf, int size, alloc_kind_t kind,
+            const alloc_attr_t &attr = {}) {
+        out_allocs_.push_back(alloc_t::make(buf, size, kind, attr));
+    }
+
+    // Handles GMEM to SLM load for A and B. Done in two steps:
+    // 1. Load: GMEM -> GRF (temporary)
+    // 2. Store: GRF (temporary) -> SLM
+    void prepare_gmem_to_slm(const char *tag, bool use_x_slm,
+            const tensor_t &tg_tile, const view_t &x_gmem_view,
+            const expr_t &xp_buf, const expr_t &x_slm_buf, view_t &x_slm_view,
+            g2s_context_t &g2s_ctx) {
+        if (!use_x_slm) return;
+
+        grid_info_t load_grid = gemm_schedule_.tg_grid();
+        for (;;) {
+            bool ok = prepare_gmem_to_slm_impl(tag, use_x_slm, tg_tile,
+                    x_gmem_view, xp_buf, x_slm_buf, x_slm_view, load_grid,
+                    g2s_ctx);
+            if (ok) {
+                g2s_ctx.prev_load_grid = load_grid;
+                g2s_ctx.register_grid(load_grid);
+                return;
+            }
+
+            // Reduce grid and try again.
+            auto grid_idx = g2s_ctx.create_tmp_grid_idx();
+            int dim_idx;
+            expr_t grid_idx_value;
+            auto new_load_grid
+                    = load_grid.halven(grid_idx, dim_idx, grid_idx_value);
+            if (new_load_grid.is_empty()) break;
+
+            if (new_load_grid == g2s_ctx.prev_load_grid) {
+                new_load_grid = load_grid.halven(
+                        grid_idx, dim_idx, grid_idx_value, /*first=*/false);
+                g2s_ctx.reuse_buffers = true;
+            }
+            g2s_ctx.set_grid_idx_value(grid_idx, grid_idx_value);
+
+            ir_ctx_.add_constraint(grid_idx >= 0);
+            ir_ctx_.add_constraint(grid_idx < new_load_grid.dim(dim_idx));
+
+            load_grid = new_load_grid;
+        }
+        ir_error_not_expected() << "Can't create GMEM -> SLM loads/stores.";
+    }
+
+    bool prepare_gmem_to_slm_impl(const char *tag, bool use_x_slm,
+            const tensor_t &tg_tile, const view_t &x_gmem_view,
+            const expr_t &xp_buf, const expr_t &x_slm_buf, view_t &x_slm_view,
+            const grid_info_t &load_grid, g2s_context_t &g2s_ctx) {
+        bool is_a = (tag[0] == 'A');
+        abc_kind_t ab_kind = (is_a ? abc_kind_t::a : abc_kind_t::b);
+
+        auto xp_slm_layout = create_slm_layout(x_gmem_view, ab_kind, load_grid);
+
+        auto grid_cond = load_grid.slice_condition();
+
+        // Per-thread tile and view to load from GMEM and store to SLM.
+        tensor_t thr_tile;
+        view_t x_g2s_view;
+        if (cfg_.allow_slm_tg_slicing()) {
+            x_g2s_view = x_gmem_view.split(load_grid, thr_tile);
+        } else {
+            thr_tile = xp_slm_layout.split(load_grid);
+            x_g2s_view = x_gmem_view.create_sub_view(thr_tile);
+        }
+
+        auto bound_cond = expr_t();
+        if (is_a && !cfg_.fuse_spatial()
+                && thr_tile.elems() * load_grid.elems()
+                        != xp_slm_layout.elems()) {
+            for (int i = 0; i < x_gmem_view.nvdims(); i++) {
+                if (!x_g2s_view.vstart(i).is_equal(x_gmem_view.vstart(i))) {
+                    auto dim_expr
+                            = x_g2s_view.vstart(i) - x_gmem_view.vstart(i);
+                    if (bound_cond.is_empty())
+                        bound_cond = dim_expr < x_gmem_view.vdims()[i];
+                    else
+                        bound_cond &= dim_expr < x_gmem_view.vdims()[i];
+                }
             }
         }
-        return ret;
+        if (!bound_cond.is_empty()) {
+            if (!grid_cond.is_empty())
+                grid_cond = grid_cond & bound_cond;
+            else
+                grid_cond = bound_cond;
+        }
+
+        auto slm_thr_layout = xp_slm_layout.map(thr_tile);
+
+        // Ensure that each thread writes a dense region to SLM. If the layout
+        // is not dense, return and try with smaller grid.
+        if (!slm_thr_layout.is_dense()) return false;
+
+        register_compute_buffer(
+                x_slm_buf, xp_slm_layout.size(), alloc_kind_t::slm);
+        ab_slm_size_ += xp_slm_layout.size();
+
+        // Temporary GRF buffer.
+        expr_t x_g2s_reg_buf = g2s_ctx.create_buf("g2s");
+
+        // GMEM -> GRF load.
+        auto x_read = make_access_builder(ir_ctx_, x_g2s_view, xp_buf,
+                x_g2s_reg_buf, send_op_t::load, send_address_t::a64);
+        ir_trace() << tag << " GMEM to GRF load:\n"
+                   << x_read.str() << std::endl;
+
+        g2s_ctx.set_buf_size(x_g2s_reg_buf, x_read.reg_buf_size());
+
+        auto load_stmt = x_read.stmt();
+        if (!grid_cond.is_empty()) load_stmt = if_t::make(grid_cond, load_stmt);
+        g2s_load_stmt_ = g2s_load_stmt_.append(load_stmt);
+
+        // GRF -> SLM store.
+        auto x_write = make_access_builder(ir_ctx_, view_t(slm_thr_layout),
+                x_slm_buf, x_g2s_reg_buf, send_op_t::store,
+                send_address_t::slm);
+        ir_trace() << tag << " GRF to SLM store:\n"
+                   << x_write.str() << std::endl;
+        auto store_stmt = x_write.stmt();
+
+        auto &read_layout = x_read.reg_layout();
+        auto &write_layout = x_write.reg_layout();
+        if (read_layout != write_layout) {
+            if (is_a ? cfg_.allow_a_grf_reorder()
+                     : cfg_.allow_b_grf_reorder()) {
+                // Temporary GRF buffer.
+                expr_t tmp_buf
+                        = g2s_ctx.create_buf("g2s_tmp", /*force_reuse=*/true);
+                auto reorder_stmt = create_reorder_stmt(
+                        read_layout, write_layout, x_g2s_reg_buf, tmp_buf);
+                g2s_ctx.set_buf_size(tmp_buf, x_write.reg_buf_size());
+                store_stmt = substitute(store_stmt, x_g2s_reg_buf, tmp_buf);
+                store_stmt = reorder_stmt.append(store_stmt);
+            } else {
+                ir_error_not_expected() << "Requested register layouts for "
+                                        << tag << " do not match: "
+                                        << "read: " << read_layout
+                                        << ", write: " << write_layout;
+            }
+        }
+        // Generate reduction statement for B.
+        if (!is_a && cfg_.reduce_b()) {
+            auto absolute_thr_tile = tg_tile.create_sub_tensor(thr_tile);
+            b_reduce_ctx_.init_reduced_thr_view(absolute_thr_tile, grid_cond);
+            auto reduce_stmt = b_reduce_ctx_.create_reduce_stmt(
+                    read_layout, x_g2s_reg_buf);
+            store_stmt = reduce_stmt.append(store_stmt);
+        }
+        if (!grid_cond.is_empty())
+            store_stmt = if_t::make(grid_cond, store_stmt);
+        g2s_store_stmt_ = g2s_store_stmt_.append(store_stmt);
+
+        x_slm_view = view_t(xp_slm_layout);
+
+        return true;
+    }
+
+    void prepare_prefetch(const char *tag, bool use_prefetch,
+            const view_t &x_gmem_view, const expr_t &xp_buf) {
+        if (!use_prefetch) return;
+
+        // Per-thread view to prefetch from GMEM.
+        auto thr_view = x_gmem_view.split(gemm_schedule_.tg_grid());
+
+        auto send_hint = get_send_hint(ir_ctx_.exec_cfg(), send_op_t::prefetch,
+                (tag[0] == 'A') ? abc_kind_t::a : abc_kind_t::b, thr_view,
+                gemm_schedule_);
+
+        // GMEM prefetch.
+        auto x_prefetch = make_access_builder(ir_ctx_, thr_view, xp_buf,
+                expr_t(), send_op_t::prefetch, send_address_t::a64, send_hint);
+
+        // too many prefetches degrades performance
+        if (find_objects<func_call_t>(x_prefetch.stmt()).size() > 16) {
+            ir_warning() << "Dropping excessive prefetches." << std::endl;
+            prefetch_stmt_ = stmt_t();
+        } else {
+            ir_trace() << tag << " GMEM prefetch:\n"
+                       << x_prefetch.str() << std::endl;
+            prefetch_stmt_ = prefetch_stmt_.append(x_prefetch.stmt());
+        }
+    }
+
+    layout_t create_slm_layout(const view_t &tg_view, abc_kind_t abc_kind,
+            const grid_info_t &load_grid) const {
+        auto layout = tg_view.create_dense_vlayout();
+        auto ret = fma_helper_.convert_to_fma_friendly_layout(layout, abc_kind,
+                /*is_slm=*/true, gemm_schedule_.bmnk_mapper());
+        if (cfg_.pad_slm()) ret = pad_slm_layout(ret, load_grid);
+        return ret.normalize();
+    }
+
+    // SLM has 65 dword-granularity banks (Xe_HP):
+    //      banks:   [bank 0] [bank 1] [bank 2] ... [bank 0]
+    // byte offsets: | 0      | 4      | 8      ... | 4 * 65
+    // SLM reads don't have conflicts. During SLM writes each fused EU writes
+    // 64 bytes (in total 128 bytes per clock). If there are repeating banks
+    // between 128 bytes the write takes 2 clocks to complete.
+    // Assume that every X-axis thread (across tg_dim[0]) writes the
+    // corresponding outer block of the layout. The goal is to ensure that the
+    // stride between outer blocks allows to avoid duplicated banks.
+    layout_t pad_slm_layout(
+            const layout_t &layout, const grid_info_t &load_grid) const {
+        // EUs are not fused in XeHPC+ so no need to pad SLM.
+        if (ir_ctx_.hw() >= ngen::HW::XeHPC) return layout;
+        auto tg_dim0 = load_grid.dim(0);
+        auto tg_dim1 = load_grid.dim(1);
+        int type_size = layout.type().size();
+
+        ir_assert(layout.elems() % tg_dim0 == 0) << layout;
+        dim_t inner_block = layout.elems() / tg_dim0;
+
+        ir_assert((inner_block * type_size) % tg_dim1 == 0) << layout;
+        dim_t per_thr_bytes = (inner_block * type_size) / tg_dim1;
+
+        std::vector<dim_t> multi_blocks = {inner_block, tg_dim0};
+        auto l = layout.split_into_multi_blocks(multi_blocks);
+
+        if (l.is_empty()) {
+            ir_warning() << "Couldn't split layout for SLM padding."
+                         << std::endl;
+            return layout;
+        }
+        auto padded_blocks = l.blocks();
+        dim_t stride = -1;
+        dim_t remaining_elems = inner_block;
+        bool past_inner_block = remaining_elems == 1;
+        for (auto &b : padded_blocks) {
+            if (past_inner_block) {
+                if (stride == -1) {
+                    dim_t stride_bytes = find_min_stride_without_conflicts(
+                            per_thr_bytes, dim_t(b.stride) * type_size);
+                    ir_assert(stride_bytes % type_size == 0);
+                    stride = stride_bytes / type_size;
+                }
+                b.stride = stride;
+                stride = b.stride * b.block;
+                continue;
+            }
+            ir_assert(remaining_elems % b.block == 0);
+            remaining_elems /= b.block;
+            if (remaining_elems == 1) past_inner_block = true;
+        }
+        return layout_t(
+                layout.type(), layout.ndims(), layout.offset(), padded_blocks);
+    }
+
+    dim_t find_min_stride_without_conflicts(
+            dim_t inner_bytes, dim_t dense_stride_bytes) const {
+        int write_step = 64;
+        int stride_step = 16;
+        dim_t stride_beg = dense_stride_bytes;
+        dim_t stride_end = 2 * dense_stride_bytes;
+        auto arch = convert_ngen_arch_to_dnnl(ir_ctx_.hw());
+        const int slm_banks
+                = compute::device_info_t::slm_memory_bank_count(arch);
+        const int bank_granularity
+                = compute::device_info_t::slm_memory_bank_granularity(arch);
+        for (dim_t s = stride_beg; s < stride_end; s += stride_step) {
+            bool ok = true;
+            for (dim_t off0 = 0; off0 < inner_bytes; off0 += write_step) {
+                // Check banks for a single SLM write.
+                std::vector<bool> found(slm_banks, false);
+                for (dim_t off = off0; off < off0 + write_step;
+                        off += bank_granularity) {
+                    int bank0 = (off / bank_granularity) % slm_banks;
+                    int bank1 = ((off + s) / bank_granularity) % slm_banks;
+                    if (found[bank0]) {
+                        ok = false;
+                        break;
+                    }
+                    found[bank0] = true;
+                    if (found[bank1]) {
+                        ok = false;
+                        break;
+                    }
+                    found[bank1] = true;
+                }
+                if (ok) return s;
+            }
+        }
+
+        ir_warning()
+                << "Couldn't find stride without conflicts for SLM padding."
+                << std::endl;
+
+        return dense_stride_bytes;
     }
 
     const conv_config_t &cfg_;
-    const conv_plan_t &plan_;
     ir_context_t &ir_ctx_;
-    const kernel_info_t &kernel_info_;
+    post_op_context_t post_op_ctx_;
+    b_reduce_context_t b_reduce_ctx_;
 
-    stmt_t g2s_load_stmt_;
-    stmt_t g2s_store_stmt_;
-    stmt_t prefetch_stmt_;
-    stmt_t x2r_mul_stmt_;
-    stmt_t c_store_stmt_;
-    stmt_t b_reduce_store_stmt_;
+    g2s_context_t g2s_ctx_;
+    fma_helper_t fma_helper_;
 
-    buffer_manager_t buf_mgr_;
+    gemm_schedule_t gemm_schedule_;
 
     expr_t ap_buf_;
     expr_t bp_buf_;
     expr_t cp_buf_;
-    expr_t b_reduce_buf_;
+
+    std::vector<stmt_t> compute_allocs_;
+    std::vector<stmt_t> out_allocs_;
+    int ab_slm_size_ = 0;
+
+    stmt_t g2s_load_stmt_;
+    stmt_t g2s_store_stmt_;
+    stmt_t prefetch_stmt_;
+    stmt_t load_mul_stmt_;
+
+    stmt_t c_zero_out_stmt_;
+    stmt_t c_store_stmt_;
+
+    stmt_t b_reduced_zero_out_stmt_;
+    stmt_t b_reduced_store_stmt_;
+
+    const kernel_info_t &kernel_info_;
 };
 
 class compute_loop_label_injector_t : public ir_mutator_t {
@@ -647,16 +2528,16 @@ stmt_t inject_compute_loop_label(const stmt_t &s) {
 }
 
 void conv_ir_builder_t::build() {
-    auto &prb = cfg_.prb();
+    constraint_set_t init_cset;
 
     trace_reset();
 
     std::vector<stmt_t> init_stmts;
-    auto &plan = cfg_.plan();
-    auto gemm_schedule = plan.gemm_schedule;
-    auto init_cset = plan.init_cset;
     init_kernel_grid(cfg_.kernel_grid(), cfg_.thread_group_grid(), cfg_.simd(),
             init_cset, init_stmts);
+
+    gemm_schedule_t gemm_schedule(
+            init_cset, cfg_.kernel_grid(), cfg_.thread_group_grid());
 
     // Initialize memory buffers.
     std::vector<stmt_t> inner_lets;
@@ -666,22 +2547,42 @@ void conv_ir_builder_t::build() {
     view_t c_view;
     view_t bp_reduced_view;
 
-    expr_t ap_buf = kernel_info_.find_arg(prb.is_bwd_d ? "dst" : "src");
-    expr_t bp_buf = kernel_info_.find_arg(prb.is_bwd_w ? "dst" : "wei");
-    expr_t cp_buf = kernel_info_.find_arg(
-            prb.is_fwd ? "dst" : (prb.is_bwd_d ? "src" : "wei"));
-    expr_t b_reduced_mem_buf
-            = kernel_info_.find_arg("bia", /*allow_empty=*/true);
+    expr_t ap_buf;
+    expr_t bp_buf;
+    expr_t cp_buf;
+    expr_t b_reduced_mem_buf;
     expr_t b_reduction_condition;
+
+    if (cfg_.prb().is_fwd) {
+        init_fwd(gemm_schedule, a_view, b_view, c_view, ap_buf, bp_buf, cp_buf);
+    } else if (cfg_.prb().is_bwd_d) {
+        init_bwd_d(
+                gemm_schedule, a_view, b_view, c_view, ap_buf, bp_buf, cp_buf);
+    } else if (cfg_.prb().is_bwd_w) {
+        init_bwd_w(gemm_schedule, a_view, b_view, c_view, bp_reduced_view,
+                ap_buf, bp_buf, cp_buf, b_reduced_mem_buf,
+                b_reduction_condition);
+    } else {
+        ir_error_not_expected();
+    }
+
+    gemm_schedule.finalize();
 
     trace_stamp("GEMM Schedule");
 
     ir_context_t ir_ctx(cfg_.exec_cfg(), init_cset);
+    post_op_context_t post_op_ctx(cfg_, gemm_schedule, kernel_info_);
     compute_builder_t cb(cfg_, ir_ctx, kernel_info_);
+
+    cb.set_gemm_schedule(gemm_schedule);
     cb.set_ap_buf(ap_buf);
     cb.set_bp_buf(bp_buf);
     cb.set_cp_buf(cp_buf);
-    cb.set_b_reduce_buf(b_reduced_mem_buf);
+    cb.set_b_reduced_mem_buf(b_reduced_mem_buf);
+    cb.set_b_reduced_view(bp_reduced_view);
+    cb.set_post_op_context(post_op_ctx);
+    cb.set_reduce_condition(b_reduction_condition);
+
     cb.build();
 
     trace_stamp("Compute Builder");
@@ -709,6 +2610,7 @@ void conv_ir_builder_t::build() {
     stmt_ = stmt_seq_t::make(stmt_, c_store_stmt);
 
     stmt_ = cb.inject_out_alloc_stmts(stmt_);
+    stmt_ = cb.inject_let_stmts(stmt_);
 
     stmt_ = gemm_schedule.create_bind_stmt(stmt_);
     stmt_ = inject_let_stmts(stmt_, init_stmts);
@@ -733,12 +2635,8 @@ void conv_ir_builder_t::build() {
     stmt_ = split_wide_stores(stmt_, ir_ctx);
     stmt_ = lift_alloc(stmt_, ir_ctx, cfg_.pipeline().reuse_headers());
     stmt_ = lift_send_2d_header_store(stmt_, ir_ctx);
-    stmt_ = hoist_send_masks(stmt_, ir_ctx, stmt_label_t::c_store(), false,
-            cfg_.reserved_regs());
+    stmt_ = hoist_send_masks(stmt_, ir_ctx, stmt_label_t::c_store(), false);
     stmt_ = split_shuffle(stmt_, ir_ctx);
-    stmt_ = fixup_if_conditions(stmt_, ir_ctx);
-    stmt_ = optimize_int64_exprs(stmt_, ir_ctx);
-    stmt_ = fix_int32_overflow(stmt_, ir_ctx);
     stmt_ = eliminate_common_subexprs(
             stmt_, ir_ctx, cfg_.reserved_regs(), cfg_.slm().gmem_bufs());
     stmt_ = hoist_exprs(stmt_, ir_ctx, cfg_.reserved_regs());
@@ -749,13 +2647,20 @@ void conv_ir_builder_t::build() {
         stmt_ = update_loops_for_unrolling(stmt_, ir_ctx);
         stmt_ = inject_unrolling(stmt_, ir_ctx, cfg_, cb.ab_slm_size());
     }
-    stmt_ = hoist_send_masks(stmt_, ir_ctx, stmt_label_t::compute_loop(), true,
-            cfg_.reserved_regs());
+    if (cfg_.hoist_masks_from_compute_loop()) {
+        stmt_ = hoist_send_masks(
+                stmt_, ir_ctx, stmt_label_t::compute_loop(), true);
+    }
+    stmt_ = fixup_if_conditions(stmt_, ir_ctx);
     stmt_ = unroll_loops(stmt_, ir_ctx);
     stmt_ = simplify(stmt_, ir_ctx);
+    stmt_ = maybe_strip_prefetches(stmt_, ir_ctx, cfg_.reserved_regs());
     stmt_ = optimize_alloc_let(stmt_, ir_ctx);
-
-    if (cfg_.hw() > ngen::HW::XeLP) stmt_ = optimize_peephole(stmt_, ir_ctx);
+    if (cfg_.hoist_masks_from_compute_loop()) {
+        stmt_ = remove_spurious_send_mask_cast(stmt_, ir_ctx);
+    }
+    stmt_ = fix_int32_overflow(stmt_, ir_ctx);
+    stmt_ = optimize_peephole(stmt_, ir_ctx);
     stmt_ = optimize_barrier(stmt_, ir_ctx);
     if (cfg_.fma_kind() == fma_kind_t::dp4a) stmt_ = inject_dp4a(stmt_, ir_ctx);
     stmt_ = inject_bank_conflict_attribute(stmt_, ir_ctx);

@@ -1,6 +1,6 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
-* Copyright 2022-2023 FUJITSU LIMITED
+* Copyright 2019-2022 Intel Corporation
+* Copyright 2022 FUJITSU LIMITED
 * Copyright 2022 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,11 +18,8 @@
 
 #include <functional>
 
-#include "common/dnnl_thread.hpp"
-#include "cpu/cpu_primitive.hpp"
-
-#include "cpu/aarch64/injectors/jit_uni_postops_injector.hpp"
 #include "cpu/aarch64/jit_uni_binary.hpp"
+#include "cpu/cpu_primitive.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -124,8 +121,8 @@ status_t jit_uni_binary_t::pd_t::init(engine_t *engine) {
 
     // All operations over blocking descriptors should have md initialized.
     conf_.is_src_different_layouts = !compare_layouts(src0_md_, src1_md_);
-    ok = post_ops_ok(attr(), src_md(0), dst_md(),
-                 conf_.is_src_different_layouts, conf_.isa)
+    ok = post_ops_ok(
+                 attr(), src_md(0), dst_md(), conf_.is_src_different_layouts)
             && (conf_.is_i8 || elt_idx == -1
                     || IMPLICATION(!dst_md_.is_dense(),
                             cpu_eltwise_fwd_pd_t::eltwise_preserves_zero(
@@ -190,7 +187,7 @@ op_t jit_uni_binary_t::pd_t::get_op_type(const memory_desc_wrapper &src0_d) {
     const auto &strides = src0_d.blocking_desc().strides;
     const auto ndims = src0_d.ndims();
 
-    if (!src0_d.is_plain() && src0_d.blocking_desc().inner_idxs[0] == 1)
+    if (!src0_d.is_plain())
         return op_t::c_blocked;
     else if (strides[1] == 1)
         return op_t::n_spatial_c;
@@ -424,8 +421,7 @@ bool jit_uni_binary_t::pd_t::is_applicable() {
 
 bool jit_uni_binary_t::post_ops_ok(const primitive_attr_t *attr,
         const memory_desc_wrapper &src0_d, const memory_desc_wrapper &dst_d,
-        const bool is_src_different_layouts, const cpu_isa_t isa) {
-    using namespace injector;
+        const bool is_src_different_layouts) {
     using namespace primitive_kind;
 
     const auto &p = attr->post_ops_;
@@ -436,44 +432,30 @@ bool jit_uni_binary_t::post_ops_ok(const primitive_attr_t *attr,
         }
         return false;
     };
-    const auto supported_strategies = get_supported_postops_bcast_strategies();
-    if (!injector::post_ops_ok(post_ops_ok_args_t(isa, {binary, eltwise, sum},
-                p, &dst_d, false /*sum_at_pos_0_only*/,
-                false /*sum_requires_scale_one*/, true /*sum_requires_zp_zero*/,
-                true /*sum_requires_same_params*/, supported_strategies)))
-        return false;
-
-    // data type of int8 dst is allowed to differ from src0 unless there is a sum postop
-    // TODO: remove this limitation as it appears unnecessary
-    if (p.find(primitive_kind::sum) != -1)
-        if (src0_d.data_type() != dst_d.data_type()) return false;
-
-    // no prelu support
-    if (p.find(primitive_kind::prelu) != -1) return false;
-
     const auto is_binary = [&](int idx) { return p.entry_[idx].is_binary(); };
+    const auto is_binary_bf16 = [&](int idx) {
+        return is_binary(idx)
+                && p.entry_[idx].binary.src1_desc.data_type == data_type::bf16;
+    };
+    const bool is_sve = mayiuse(sve_128);
+    if (!is_sve) return false;
 
-    if (!mayiuse(sve_128)) return false;
-
+    const auto supported_strategies = get_supported_postops_bcast_strategies();
     for (int i = 0; i < p.len(); i++) {
+        if (is_binary_bf16(i)) return false;
         if (p.contain(primitive_kind::sum, i)) {
             if (p.entry_[i].sum.zero_point != 0) return false;
             if (src0_d.data_type() != dst_d.data_type()) return false;
+        } else if (!(is_eltwise(i) || is_binary(i))) {
+            return false;
         } else if (is_binary(i)) {
             const auto &post_ops_mem = p.entry_[i].binary.src1_desc;
-            const bool is_src1_bf16 = post_ops_mem.data_type == data_type::bf16;
-            const bool is_src1_f16 = post_ops_mem.data_type == data_type::f16;
-            if (is_src1_bf16 || is_src1_f16) return false;
-            // TODO: eliminate in favor of check in injectors::post_ops_ok
-            // (conditions are slightly different, need to check corner cases)
             if (get_rhs_arg_broadcasting_strategy(
                         post_ops_mem, dst_d, supported_strategies)
                     == broadcasting_strategy_t::no_broadcast) {
                 const memory_desc_wrapper post_op_mem_d(post_ops_mem);
                 if (!post_op_mem_d.similar_to(dst_d, true, false)) return false;
             }
-        } else if (!is_eltwise(i)) {
-            return false;
         }
     }
 
@@ -538,7 +520,7 @@ binary_kernel_t *create_binary_kernel(
     } else {
         assert(!"unreachable");
     }
-    assert(!"Could not create binary kernel");
+
     return nullptr;
 }
 

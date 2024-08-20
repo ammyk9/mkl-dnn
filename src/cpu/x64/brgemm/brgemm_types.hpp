@@ -34,8 +34,6 @@ typedef enum {
     brgemm_offs = 2,
     // Base address and fixed stride between matrices.
     brgemm_strd = 3,
-    // Base address and static array of fixed offsets.
-    brgemm_static_offs = 4,
 } brgemm_batch_kind_t;
 
 // The type defines the storage format of matrix
@@ -68,25 +66,76 @@ typedef enum {
 
 typedef enum {
     brgemm_prf_default = 1,
-    brgemm_prf1,
-    brgemm_prf2,
+    brgemm_prf1 = 2,
+    brgemm_prf2 = 3,
 } brgemm_kernel_prefetching_t;
 
 typedef enum {
-    brgemm_innermost_undef = 0,
-    brgemm_bd_loop_innermost,
+    brgemm_bd_loop_innermost = 0,
     brgemm_ld_loop_innermost,
 } brgemm_kernel_innermost_loop_t;
 
 typedef enum {
-    brgemm_hint_nt_undef = 0,
-    brgemm_hint_nt_false,
-    brgemm_hint_nt_true,
+    brgemm_hint_nt_undef = -1,
+    brgemm_hint_nt_false = 0,
+    brgemm_hint_nt_true = 1,
 } brgemm_kernel_hint_nt_t;
 
 struct brgemm_prf_t {
     int dist1 = -1;
     int dist2 = -1;
+};
+
+struct DNNL_API brgemm_attr_t {
+    brgemm_attr_t();
+    // if unrolled kernel is used (use_uker == true)
+    // then "max_bs" is the the only batch size that can be used on kernel call
+    // else "max_bs" is the maximum batch size that can be used
+    int max_bs;
+    int max_top_vpad, max_bottom_vpad;
+    dim_t hint_expected_A_size, hint_expected_B_size, hint_expected_C_size;
+    brgemm_kernel_innermost_loop_t hint_innermost_loop
+            = brgemm_ld_loop_innermost;
+    brgemm_kernel_loop_order_t hint_loop_order;
+    brgemm_kernel_prefetching_t hint_prefetching
+            = brgemm_kernel_prefetching_t::brgemm_prf_default;
+    brgemm_prf_t hint_prfA, hint_prfB, hint_prfC;
+
+    bool wary_tail_read;
+    bool generate_skip_accumulation;
+    // bd_mask is char array in which each element is a boolean value that
+    // determines whether to write this row to the result matrix or skip
+    char *bd_mask;
+    // Value of bd_mask_level specifies how bd_mask is used in brgemm kernel
+    // 0 – bd_mask is not used
+    // 1 – bd_mask is used on storing stage only
+    // 2 – bd_mask used both on reading and storing stages
+    int bd_mask_level;
+    // use_uker is a boolean value that determines whether to use the unrolled
+    // kernel or not
+    bool use_uker;
+    // use_interleave_stores is a value that determines whether to use the
+    // interleave stores or not
+    bool use_interleave_stores;
+    impl::fpmath_mode_t fpmath_mode = fpmath_mode::strict;
+    // Second level leading dimension describing distance between 16-line
+    // blocks in case of blocked layout. Used to calculate address of next
+    // bd block. By default are equal to regular leading dimension parameters
+    // specified on brgemm creation.
+    // Supported by brgemm unrolled kernel for now.
+    int LDA2 {0}, LDB2 {0}, LDC2_M {0}, LDC2_N {0};
+    // If "true" then batchsize is allowed to change on each kernel call
+    // and there is no unrolling by batchsize in kernel
+    bool var_bs {false};
+    bool postops_only {false};
+
+    int hint_bd_block {0};
+    int hint_ld_block {0};
+    int hint_bd_block2 {0};
+    int hint_ld_block2 {0};
+
+    brgemm_kernel_hint_nt_t hint_load_nt_A {brgemm_hint_nt_undef};
+    brgemm_kernel_hint_nt_t hint_load_nt_B {brgemm_hint_nt_undef};
 };
 
 struct brgemm_batch_element_t {
@@ -116,72 +165,7 @@ struct brgemm_batch_element_t {
     };
 };
 
-struct DNNL_API brgemm_attr_t {
-    brgemm_attr_t();
-    // if unrolled kernel is used (use_uker == true)
-    // then "max_bs" is the the only batch size that can be used on kernel call
-    // else "max_bs" is the maximum batch size that can be used
-    int max_bs;
-    int max_top_vpad, max_bottom_vpad;
-    dim_t hint_expected_A_size, hint_expected_B_size, hint_expected_C_size;
-    brgemm_kernel_innermost_loop_t hint_innermost_loop
-            = brgemm_ld_loop_innermost;
-    brgemm_kernel_loop_order_t hint_loop_order;
-    brgemm_kernel_prefetching_t hint_prefetching
-            = brgemm_kernel_prefetching_t::brgemm_prf_default;
-    brgemm_prf_t hint_prfA, hint_prfB, hint_prfC;
-
-    bool wary_tail_read;
-    bool generate_skip_accumulation;
-    // Value of bd_mask_level specifies how bd_mask is used in brgemm kernel
-    // 0 – bd_mask is not used
-    // 1 – bd_mask is used on storing stage only
-    // 2 – bd_mask used both on reading and storing stages
-    int bd_mask_level;
-    // use_uker is a boolean value that determines whether to use the unrolled
-    // kernel or not
-    bool use_uker;
-    // use_interleave_stores is a value that determines whether to use the
-    // interleave stores or not
-    bool use_interleave_stores;
-    impl::fpmath_mode_t fpmath_mode = fpmath_mode::strict;
-    // Second level leading dimension describing distance between 16-line
-    // blocks in case of blocked layout. Used to calculate address of next
-    // bd block. By default are equal to regular leading dimension parameters
-    // specified on brgemm creation.
-    // Supported by brgemm unrolled kernel for now.
-    int LDA2 {0}, LDB2 {0}, LDC2_M {0}, LDC2_N {0};
-    // If "true" then batchsize is allowed to change on each kernel call
-    // and there is no unrolling by batchsize in kernel
-    bool var_bs {false};
-    bool postops_only {false};
-
-    int hint_bd_block {0};
-    int hint_ld_block {0};
-    int hint_bd_block2 {0};
-    int hint_ld_block2 {0};
-    bool hint_ununroll_bd_loop {false};
-
-    brgemm_kernel_hint_nt_t hint_load_nt_A {brgemm_hint_nt_undef};
-    brgemm_kernel_hint_nt_t hint_load_nt_B {brgemm_hint_nt_undef};
-    // this variable is used in tile decomposition heuristics
-    // to calculate "effective" K value which may be different from just
-    // K * batch_size for non-1x1 convolutions due to data overlap
-    float K_koef = 1.f;
-    // this flag may be used to omit some actions on calling from blocking
-    // in convolutions init_conf
-    bool test_call = false;
-    // bd_mask is char array in which each element is a boolean value that
-    // determines whether to write this row to the result matrix or skip
-    const char *bd_mask;
-    // static_offsets is a static array of fixed offsets used for
-    // brgemm_static_offs batch kind
-    const brgemm_batch_element_t *static_offsets;
-};
-
 struct brgemm_t {
-    // Note: new added parameters must be taken into account in the brgemm
-    // comparison function
     int bcast_dim = 0; // M;
     int load_dim = 0; // N;
     int reduce_dim = 0; // K;
@@ -195,43 +179,12 @@ struct brgemm_t {
     // is created, as calls to set_attr can affect this variable. Ex: bf32
     impl::cpu::x64::cpu_isa_t isa_user = isa_undef;
     impl::cpu::x64::cpu_isa_t isa_impl = isa_undef;
-    float alpha = 0.0f;
-    float beta = 0.0f;
 
-    impl::data_type_t dt_a = data_type::undef;
-    impl::data_type_t dt_c = data_type::undef;
-    impl::data_type_t dt_b = data_type::undef;
-    impl::data_type_t dt_d = data_type::undef;
-    impl::data_type_t dt_bias = data_type::undef;
-
-    dim_t stride_a = 0; // Offset in bytes
-    dim_t stride_b = 0;
-
-    brgemm_layout_t layout = brgemm_layout_undef;
-    brgemm_batch_kind_t type;
-    bool is_dgmm = false; // set to true in brdgmm_desc_init
-    bool with_sum = false;
-    bool req_cal_comp_pads = false;
-
-    float sum_scale = 0.0f;
-    int32_t sum_zp = 0;
-    impl::data_type_t sum_dt;
-    bool with_eltwise = false;
-    bool with_binary = false;
-    bool with_scales = false;
-
-    brgemm_broadcast_t zp_type_a = brgemm_broadcast_t::none;
-    brgemm_broadcast_t zp_type_b = brgemm_broadcast_t::none;
-    brgemm_broadcast_t zp_type_c = brgemm_broadcast_t::none;
-
-    int is_oc_scale = 0;
-    bool with_dst_scales = false;
-
-    brgemm_attr_t brgattr;
-
-    // Derived  parameters
     int LDA2 {0}, LDB2 {0}, LDC2_M {0}, LDC2_N {0};
     bool is_blocked = false;
+
+    float alpha = 0.0f;
+    float beta = 0.0f;
 
     int bdb = 0, bd_block = 0, bdb_tail = 0;
     int bdb2 = 0, bd_block2 = 0, bdb2_tail = 0;
@@ -239,6 +192,12 @@ struct brgemm_t {
     int ldb2 = 0, ld_block2 = 0, ldb2_tail = 0;
     int rdb = 0, rd_block = 0, rdb_tail = 0;
     int rd_step = 0, ld_step = 0;
+
+    impl::data_type_t dt_a = data_type::undef;
+    impl::data_type_t dt_c = data_type::undef;
+    impl::data_type_t dt_b = data_type::undef;
+    impl::data_type_t dt_d = data_type::undef;
+    impl::data_type_t dt_bias = data_type::undef;
 
     int typesize_A = 0;
     int typesize_B = 0;
@@ -255,25 +214,45 @@ struct brgemm_t {
     bool is_f32 = false;
     bool is_bf32 = false;
 
-    bool has_int8_vnni = false;
+    dim_t stride_a = 0; // Offset in bytes
+    dim_t stride_b = 0;
+
+    brgemm_layout_t layout = brgemm_layout_undef;
+    brgemm_batch_kind_t type;
 
     bool load_nt_A = false;
     bool load_nt_B = false;
-
     bool embd_bcst = false;
+    bool is_dgmm = false; // set to true in brdgmm_desc_init
     bool with_bias = false;
+    bool with_sum = false;
+    float sum_scale = 0.0f;
+    int32_t sum_zp = 0;
+    impl::data_type_t sum_dt;
+    bool with_eltwise = false;
+    bool with_binary = false;
+    bool with_scales = false;
+    bool req_cal_comp_pads = false;
     bool req_s8s8_compensation = false;
-    bool with_weights_scale_adjust = false;
-    brgemm_kernel_innermost_loop_t innermost_loop = brgemm_ld_loop_innermost;
-    int is_M_tail;
-    bool interleave_tilestores_ = false;
-    brgemm_prf_t prfA, prfB, prfC;
+    brgemm_broadcast_t zp_type_a = brgemm_broadcast_t::none;
+    brgemm_broadcast_t zp_type_b = brgemm_broadcast_t::none;
+    brgemm_broadcast_t zp_type_c = brgemm_broadcast_t::none;
 
-    static constexpr int MAX_VPAD = 100;
-    static constexpr int AMX_TILES_NUM = 8;
+    int is_oc_scale = 0;
 
     const primitive_attr_t *attr = nullptr;
     const memory_desc_t *dst_md = nullptr;
+
+    brgemm_attr_t brgattr;
+    static constexpr int MAX_VPAD = 100;
+    static constexpr int AMX_TILES_NUM = 8;
+
+    int is_M_tail;
+
+    bool interleave_tilestores_ = false;
+
+    brgemm_prf_t prfA, prfB, prfC;
+    bool with_dst_scales = false;
 
     bool is_row_major() const {
         assert(layout != brgemm_layout_undef);
@@ -282,15 +261,11 @@ struct brgemm_t {
 
     // Tile register decomposition
     int get_bd_block2() const noexcept {
-        auto res = (bdb <= bd_block2) ? bdb : (bd_block2 + (bdb_tail ? 1 : 0));
-        return res;
+        return (bdb_tail) ? bd_block2 + 1 : bd_block2;
     }
-
     int get_ld_block2() const noexcept {
-        auto res = (ldb <= ld_block2) ? ldb : (ld_block2 + (ldb_tail ? 1 : 0));
-        return res;
+        return (ldb_tail) ? ld_block2 + 1 : ld_block2;
     }
-
     int get_num_C_tiles() const noexcept {
         return get_bd_block2() * get_ld_block2();
     }
@@ -301,33 +276,32 @@ struct brgemm_t {
         return (M * get_ld_block2() + N);
     }
 
-    int get_num_A_tiles() const noexcept {
-        const auto req_tiles = (bdb_tail && bdb > 1) ? 2 : 1;
-        const auto max_tiles = AMX_TILES_NUM - get_num_C_tiles() - 1;
-        const auto n_tiles = nstl::min(get_bd_block2(), max_tiles);
-        assert(n_tiles >= req_tiles);
-        return nstl::max(req_tiles, n_tiles);
+    int tiles_for_A() const noexcept {
+        return (AMX_TILES_NUM - get_num_C_tiles() - 1);
     }
 
     int get_A_tensor(int m, bool m_tail = false) const noexcept {
-        const auto full_A_tiles = get_num_A_tiles() - (bdb_tail ? 1 : 0);
+        auto full_A_tiles = get_num_A_tiles() - (bdb_tail ? 1 : 0);
         auto M = m_tail ? get_num_A_tiles() - 1 : m % full_A_tiles;
         return (get_num_C_tiles() + M);
     }
 
-    int get_num_B_tiles() const noexcept {
-        const auto req_tiles = (ldb_tail && ldb > 1) ? 2 : 1;
-        const auto max_tiles
-                = AMX_TILES_NUM - get_num_C_tiles() - get_num_A_tiles();
-        const auto n_tiles = nstl::min(get_ld_block2(), max_tiles);
-        assert(n_tiles >= req_tiles);
-        return nstl::max(req_tiles, n_tiles);
+    int get_num_A_tiles() const noexcept {
+        return nstl::min(get_bd_block2(), tiles_for_A());
+    }
+
+    int tiles_for_B() const noexcept {
+        return (AMX_TILES_NUM - get_num_C_tiles() - get_num_A_tiles());
     }
 
     int get_B_tensor(int n, bool n_tail = false) const noexcept {
-        const auto full_B_tiles = get_num_B_tiles() - (ldb_tail ? 1 : 0);
+        auto full_B_tiles = get_num_B_tiles() - (ldb_tail ? 1 : 0);
         auto N = n_tail ? get_num_B_tiles() - 1 : n % full_B_tiles;
         return (get_num_C_tiles() + get_num_A_tiles() + N);
+    }
+
+    int get_num_B_tiles() const noexcept {
+        return nstl::min(get_ld_block2(), tiles_for_B());
     }
 
     int get_wsp_buffer_size() const noexcept {
@@ -354,10 +328,6 @@ struct brgemm_t {
         // and transparent to user.
         return !(dt_b == data_type::f16 && isa_impl == avx512_core_fp16);
     }
-    bool is_xf16() const noexcept { return is_bf16 || is_f16; }
-
-    bool operator==(const brgemm_t &rhs) const;
-    bool operator<(const brgemm_t &rhs) const;
 };
 
 struct brgemm_kernel_params_t {
@@ -390,7 +360,7 @@ struct brgemm_kernel_params_t {
     size_t first_mb_matrix_addr_off;
     size_t dst_row_logical_off;
 
-    const char *data_C_ptr_;
+    char *data_C_ptr_;
 
     const void *a_zp_compensations = nullptr;
     const void *b_zp_compensations = nullptr;
@@ -405,14 +375,12 @@ struct jit_brgemm_kernel_t;
 struct jit_brgemm_amx_uker_base_t;
 template <cpu_isa_t isa, typename Vmm>
 struct jit_brdgmm_kernel_base_t;
-class jit_generator;
 
 struct brgemm_kernel_t {
     brgemm_kernel_t() {};
     virtual ~brgemm_kernel_t() {};
     virtual status_t create_kernel() = 0;
     virtual void operator()(brgemm_kernel_params_t *) const = 0;
-    virtual const jit_generator *get_jit_generator() const = 0;
 };
 
 template <cpu_isa_t isa, typename Vmm>
@@ -422,7 +390,6 @@ struct brgemm_kernel_common_t : public brgemm_kernel_t {
 
     status_t create_kernel();
     void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
 
 private:
     jit_brgemm_kernel_t<isa, Vmm> *brgemm_kernel_ = nullptr;
@@ -436,7 +403,6 @@ struct brgemm_amx_uker_t : public brgemm_kernel_t {
 
     status_t create_kernel();
     void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
 
 private:
     jit_brgemm_amx_uker_base_t *brgemm_kernel_ = nullptr;
@@ -451,7 +417,6 @@ struct brdgmm_kernel_t : public brgemm_kernel_t {
 
     status_t create_kernel();
     void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
 
 private:
     jit_brdgmm_kernel_base_t<isa, Vmm> *brgemm_kernel_ = nullptr;
@@ -493,8 +458,7 @@ struct brgemm_post_ops_data_t {
     brgemm_post_ops_data_t() = default;
     brgemm_post_ops_data_t(const void *bias, const float *scales,
             const void *binary_post_ops_rhs, size_t oc_logical_off,
-            const size_t dst_row_logical_off = 0,
-            const char *data_C_ptr_ = nullptr,
+            const size_t dst_row_logical_off = 0, char *data_C_ptr_ = nullptr,
             const size_t first_mb_matrix_addr_off = 0,
             const void *a_zp_compensations = nullptr,
             const void *b_zp_compensations = nullptr,
@@ -522,7 +486,7 @@ struct brgemm_post_ops_data_t {
     const void *binary_post_ops_rhs = nullptr;
     size_t oc_logical_off = 0;
     size_t dst_row_logical_off = 0;
-    const char *data_C_ptr_ = nullptr;
+    char *data_C_ptr_ = nullptr;
     size_t first_mb_matrix_addr_off = 0;
     const void *a_zp_compensations = nullptr;
     const void *b_zp_compensations = nullptr;

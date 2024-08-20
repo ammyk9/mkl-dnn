@@ -107,16 +107,14 @@ status_t xe_hp_systolic_gemm_t::pd_t::init(engine_t *engine) {
                 && IMPLICATION(b_zp_, !packed_a());
 
         int cmask_a = 0, cmask_b = 0, cmask_c = 0;
-        CHECK(attr()->zero_points_.get(DNNL_ARG_WEIGHTS, &cmask_b));
-        CHECK(attr()->zero_points_.get(DNNL_ARG_SRC, &cmask_a));
-        CHECK(attr()->zero_points_.get(DNNL_ARG_DST, &cmask_c));
+        attr()->zero_points_.get(DNNL_ARG_WEIGHTS, &cmask_b);
+        attr()->zero_points_.get(DNNL_ARG_SRC, &cmask_a);
+        attr()->zero_points_.get(DNNL_ARG_DST, &cmask_c);
         ok &= (cmask_a == 0) && (cmask_b == 0)
                 && utils::one_of(cmask_c, 0, 1 << 0, 1 << 1);
     }
 
     if (!ok) return status::unimplemented;
-
-    init_scratchpad();
 
     return status::success;
 }
@@ -366,39 +364,6 @@ bool xe_hp_systolic_gemm_t::pd_t::set_default_formats(data_type_t dt) {
     return gpu_gemm_pd_t::set_default_formats();
 }
 
-void xe_hp_systolic_gemm_t::pd_t::init_scratchpad() {
-    if (packed_a() && packed_b()) return;
-
-    auto a_type = desc()->a_type();
-    auto b_type = desc()->b_type();
-
-    auto m = desc()->m();
-    auto n = desc()->n();
-    auto k = desc()->k();
-
-    int64_t align_m = unroll_m_ * 8; // TODO: this should not be hardcoded
-    int64_t align_n = unroll_n_ * 8; // instead read from DriverInfo
-
-    auto m_aligned = utils::rnd_up(m, align_m);
-    auto n_aligned = utils::rnd_up(n, align_n);
-
-    auto max_ldab_packed = max_ld_packed(k);
-
-    auto scratchpad = scratchpad_registry().registrar();
-
-    if (!packed_a()) {
-        scratchpad.book(memory_tracking::names::key_gemm_blocked_a,
-                m_aligned * max_ldab_packed, types::data_type_size(a_type), 64,
-                65536);
-    }
-
-    if (!packed_b()) {
-        scratchpad.book(memory_tracking::names::key_gemm_blocked_b,
-                n_aligned * max_ldab_packed, types::data_type_size(b_type), 64,
-                65536);
-    }
-}
-
 status_t xe_hp_systolic_gemm_t::init(engine_t *engine) {
     arch_ = pd()->dev_info_->gpu_arch();
     eu_count_ = pd()->dev_info_->eu_count();
@@ -409,7 +374,7 @@ status_t xe_hp_systolic_gemm_t::init(engine_t *engine) {
     int cmask = -1;
 
     if (pd()->with_c_zero_points())
-        CHECK(pd()->attr()->zero_points_.get(DNNL_ARG_DST, &cmask));
+        pd()->attr()->zero_points_.get(DNNL_ARG_DST, &cmask);
     else if (pd()->with_bias())
         cmask = pd()->bias_cmask();
 
@@ -434,26 +399,23 @@ status_t xe_hp_systolic_gemm_t::init(engine_t *engine) {
             if (clear_sum && !pd()->with_ab_zero_points()) continue;
             if (!copy_b ? pd()->packed_a() : pd()->packed_b()) continue;
 
-            using copy_kernel_params_t
-                    = trivial_key_t<ocl::xe_systolic_gemm_copy_kernel_t>;
+            using copy_kernel_t = ocl::xe_systolic_gemm_copy_kernel_t;
             compute::kernel_ctx_t kernel_ctx;
 
             auto trans
                     = !copy_b ? pd()->desc()->transa() : pd()->desc()->transb();
-            copy_kernel_params_t params;
-            CHECK(params.init(arch_, !copy_b ? a_type : b_type,
-                    pd()->unroll_n(), copy_b, trans,
-                    pd()->with_ab_zero_points(), clear_sum));
+            auto status = copy_kernel_t::init_kernel_ctx(kernel_ctx, arch_,
+                    !copy_b ? a_type : b_type, pd()->unroll_n(), copy_b, trans,
+                    pd()->with_ab_zero_points(), clear_sum);
+            if (status != status::success) return status;
 
-            // TODO: Refactor so this can be switched to 1 batch compilation.
-            // Having up to 4 calls to the OpenCL compiler is sub-optimal.
-            CHECK(create_kernel(engine, copy_kernel_[copy_b][clear_sum],
-                    params.name(), params));
+            create_kernel(engine, &copy_kernel_[copy_b][clear_sum],
+                    copy_kernel_t::name(arch_), kernel_ctx);
             if (!copy_kernel_[copy_b][clear_sum]) return status::runtime_error;
         }
     }
 
-    if (verbose_debuginfo() >= 2) {
+    if (get_verbose() >= 2) {
         printf("onednn_verbose,info,gpu,gemm,kernel:%dx%d,%dx%dx%d\n",
                 pd()->unroll_m(), pd()->unroll_n(), compute_info_.wg[LoopM],
                 compute_info_.wg[LoopN], compute_info_.wg[LoopK]);
@@ -463,10 +425,8 @@ status_t xe_hp_systolic_gemm_t::init(engine_t *engine) {
 }
 
 status_t xe_hp_systolic_gemm_t::init_compute(engine_t *engine) {
+    using kernel_t = gen_gemm_kernel_t;
     using kd_t = gen_gemm_xe_systolic_kernel_desc_t;
-
-    auto *compute_engine = utils::downcast<compute::compute_engine_t *>(engine);
-    int stepping = compute_engine->device_info()->stepping_id();
 
     const auto d = pd()->desc();
 
@@ -487,13 +447,12 @@ status_t xe_hp_systolic_gemm_t::init_compute(engine_t *engine) {
 
     kd_t kd_full;
 
-    auto status = kd_full.select_kernel(arch_, stepping, eu_count_,
-            pd()->with_batch(), pd()->packed_c(), trans_co,
-            pd()->with_a_zero_points(), pd()->with_b_zero_points(),
-            pd()->with_c_zero_points(), pd()->with_bias(), pd()->alpha(),
-            pd()->beta(), *post_ops, a_type, b_type, c_type, co_type, acc_type,
-            d->m(), d->n(), d->k(), d->batch(), pd()->unroll_m(),
-            pd()->unroll_n(), pd()->alt());
+    auto status = kd_full.select_kernel(arch_, eu_count_, pd()->with_batch(),
+            pd()->packed_c(), trans_co, pd()->with_a_zero_points(),
+            pd()->with_b_zero_points(), pd()->with_c_zero_points(),
+            pd()->with_bias(), pd()->alpha(), pd()->beta(), *post_ops, a_type,
+            b_type, c_type, co_type, acc_type, d->m(), d->n(), d->k(),
+            d->batch(), pd()->unroll_m(), pd()->unroll_n(), pd()->alt());
 
     if (status != status::success) return status;
 
@@ -523,7 +482,7 @@ status_t xe_hp_systolic_gemm_t::init_compute(engine_t *engine) {
 
                 kd_t kd;
 
-                auto status = kd.select_kernel(arch_, stepping, eu_count_,
+                auto status = kd.select_kernel(arch_, eu_count_,
                         pd()->with_batch(), pd()->packed_c(), trans_co,
                         pd()->with_a_zero_points(), pd()->with_b_zero_points(),
                         this_c_offset, pd()->with_bias(), pd()->alpha(),
@@ -538,14 +497,55 @@ status_t xe_hp_systolic_gemm_t::init_compute(engine_t *engine) {
                     got_info = true;
                 }
 
-                CHECK(create_kernel(engine,
-                        kernel_[first_k_block][last_k_block], "gemm_kernel",
-                        kd));
+                kernel_t kernel(kd);
+
+                create_kernel(
+                        engine, &kernel_[first_k_block][last_k_block], &kernel);
 
                 if (!kernel_[first_k_block][last_k_block])
                     return status::runtime_error;
             }
         }
+    }
+
+    return status::success;
+}
+
+status_t xe_hp_systolic_gemm_t::init_res_storage(
+        engine_t *engine, gpu_resource_t *r) const {
+    auto a_type = pd()->desc()->a_type();
+    auto b_type = pd()->desc()->b_type();
+
+    auto m = pd()->desc()->m();
+    auto n = pd()->desc()->n();
+    auto k = pd()->desc()->k();
+
+    int64_t align_m = compute_info_.wgTile(LoopM);
+    int64_t align_n = compute_info_.wgTile(LoopN);
+
+    auto m_aligned = utils::rnd_up(m, align_m);
+    auto n_aligned = utils::rnd_up(n, align_n);
+
+    auto max_ldab_packed = max_ld_packed(k);
+
+    if (!pd()->packed_a()) {
+        memory_storage_t *a_packed_ptr;
+        engine->create_memory_storage(&a_packed_ptr,
+                m_aligned * max_ldab_packed * types::data_type_size(a_type));
+        if (!a_packed_ptr) return status::runtime_error;
+
+        std::unique_ptr<memory_storage_t> a_packed(a_packed_ptr);
+        r->add_memory_storage(A_PACKED_, std::move(a_packed));
+    }
+
+    if (!pd()->packed_b()) {
+        memory_storage_t *b_packed_ptr;
+        engine->create_memory_storage(&b_packed_ptr,
+                n_aligned * max_ldab_packed * types::data_type_size(b_type));
+        if (!b_packed_ptr) return status::runtime_error;
+
+        std::unique_ptr<memory_storage_t> b_packed(b_packed_ptr);
+        r->add_memory_storage(B_PACKED_, std::move(b_packed));
     }
 
     return status::success;
@@ -843,17 +843,8 @@ status_t xe_hp_systolic_gemm_t::execute(const gemm_exec_ctx_t &ctx) const {
     auto *co = &c_zp;
     memory_storage_t *ao = nullptr, *bo = nullptr;
 
-    std::unique_ptr<memory_storage_t> a_packed_temp, b_packed_temp;
-
-    if (!packed_a)
-        a_packed_temp = ctx.get_scratchpad_grantor().get_memory_storage(
-                memory_tracking::names::key_gemm_blocked_a);
-    if (!packed_b)
-        b_packed_temp = ctx.get_scratchpad_grantor().get_memory_storage(
-                memory_tracking::names::key_gemm_blocked_b);
-
-    auto &a_packed = packed_a ? a : *a_packed_temp;
-    auto &b_packed = packed_b ? b : *b_packed_temp;
+    auto &a_packed = packed_a ? a : CTX_GPU_RES_STORAGE(A_PACKED_);
+    auto &b_packed = packed_b ? b : CTX_GPU_RES_STORAGE(B_PACKED_);
 
     const memory_storage_t *po_srcs[GEMM_MAX_PO];
 
@@ -919,8 +910,9 @@ status_t xe_hp_systolic_gemm_t::execute(const gemm_exec_ctx_t &ctx) const {
     int64_t block_m = 0, block_n = 0, block_k = 0;
     std::tie(block_m, block_n, block_k) = get_blocking();
 
-    auto lda_packed = pd()->lda_packed(k);
-    auto ldb_packed = pd()->ldb_packed(k);
+    auto ld_packed = get_ld_packed(k);
+    auto lda_packed = packed_a ? pd()->lda_packed() : ld_packed;
+    auto ldb_packed = packed_b ? pd()->ldb_packed() : ld_packed;
 
     status_t status;
 

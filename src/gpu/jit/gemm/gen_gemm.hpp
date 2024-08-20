@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -86,9 +86,9 @@ struct gen_gemm_t : public gpu_gemm_t {
                 if (swap_ab_) std::swap(a_zp_, b_zp_);
 
                 int cmask_a = 0, cmask_b = 0, cmask_c = 0;
-                CHECK(attr()->zero_points_.get(DNNL_ARG_WEIGHTS, &cmask_b));
-                CHECK(attr()->zero_points_.get(DNNL_ARG_SRC, &cmask_a));
-                CHECK(attr()->zero_points_.get(DNNL_ARG_DST, &cmask_c));
+                attr()->zero_points_.get(DNNL_ARG_WEIGHTS, &cmask_b);
+                attr()->zero_points_.get(DNNL_ARG_SRC, &cmask_a);
+                attr()->zero_points_.get(DNNL_ARG_DST, &cmask_c);
                 ok &= (cmask_a == 0) && (cmask_b == 0)
                         && utils::one_of(cmask_c, 0, 1 << 0, 1 << 1);
 
@@ -123,9 +123,7 @@ struct gen_gemm_t : public gpu_gemm_t {
                     && IMPLICATION(with_sum_ab(),
                             !with_bias()
                                     && (attr()->zero_points_.has_default_values(
-                                            DNNL_ARG_DST)))
-                    && attr()->post_ops_.check_sum_consistency(
-                            d->c_type(), utils::one_of(d->a_type(), s8, u8));
+                                            DNNL_ARG_DST)));
 
             auto status = init_post_ops();
             if (status != status::success) return status;
@@ -133,18 +131,11 @@ struct gen_gemm_t : public gpu_gemm_t {
             bool with_binary = (post_ops_.find(binary) != -1);
 
             // check GPU architecture
-            ok &= utils::one_of(arch_, arch_t::gen9, arch_t::gen11,
-                    arch_t::xe_lp, arch_t::xe_hp, arch_t::xe_hpg,
-                    arch_t::xe_hpc);
+            ok &= utils::one_of(arch_, arch_t::gen9, arch_t::xe_lp,
+                    arch_t::xe_hp, arch_t::xe_hpg, arch_t::xe_hpc);
             ok &= IMPLICATION(with_binary, arch_ >= arch_t::xe_hp);
 
             if (!ok) return status::unimplemented;
-
-            bool has_systolic
-                    = compute_engine->mayiuse(compute::device_ext_t::
-                                      intel_subgroup_matrix_multiply_accumulate)
-                    || compute_engine->mayiuse(compute::device_ext_t::
-                                    intel_subgroup_split_matrix_multiply_accumulate);
 
             // size checks for fused reduction kernels
             if (with_sum_ab()) {
@@ -163,7 +154,8 @@ struct gen_gemm_t : public gpu_gemm_t {
 
             auto acc_type = utils::one_of(eff_a_type(), s8, u8) ? s32 : f32;
 
-            if (d->c_type() == f16 && !has_systolic) acc_type = data_type::f16;
+            if (d->c_type() == f16 && arch_ < compute::gpu_arch_t::xe_hpg)
+                acc_type = data_type::f16;
 
             if (types::data_type_size(acc_type) < 4) {
                 // Limited post-op support for low-precision accumulation.
@@ -181,8 +173,8 @@ struct gen_gemm_t : public gpu_gemm_t {
                         mode | kernel_desc_t::mode_bf16x1);
 
             status = kernel_desc_.select_kernel(arch_, stepping,
-                    dev_info_->eu_count(), has_systolic, mode, batch_dims(),
-                    eff_transa(), eff_transb(), eff_trans_bias(), swap_ab(),
+                    dev_info_->eu_count(), mode, batch_dims(), eff_transa(),
+                    eff_transb(), eff_trans_bias(), swap_ab(),
                     with_a_zero_points(), with_b_zero_points(),
                     with_c_zero_points(), with_bias(), sum_ab(), alpha(),
                     beta(), post_ops_, eff_a_type(), eff_b_type(),
@@ -194,7 +186,7 @@ struct gen_gemm_t : public gpu_gemm_t {
 
             // global k-parallel kernels don't support post-ops.
             // use global k-parallel kernels only with f32 accumulation
-            bool k_parallel_global = kernel_desc_.driver_info()->kParallel();
+            bool k_parallel_global = kernel_desc_.driver_info()->kParallel;
             bool with_eltwise = (post_ops_.find(eltwise) != -1);
 
             ok &= IMPLICATION(k_parallel_global,
@@ -400,14 +392,17 @@ struct gen_gemm_t : public gpu_gemm_t {
     status_t init(engine_t *engine) override { return init_nocopy(engine); }
 
     status_t init_nocopy(engine_t *engine) {
+        using kernel_t = gen_gemm_kernel_t;
         using namespace data_type;
 
         auto kd = pd()->kernel_desc();
-        CHECK(create_kernel(engine, nocopy_kernel_, "gemm_kernel", *kd));
+        kernel_t kernel(*kd);
+
+        create_kernel(engine, &nocopy_kernel_, &kernel);
 
         scalar_type_ = kd->scalar_type();
 
-        if (verbose_debuginfo() >= 2) {
+        if (get_verbose() >= 2) {
             auto info = kd->driver_info();
             printf("onednn_verbose,info,gpu,gemm,kernel:%dx%d,%dx%dx%d\n",
                     info->unroll[LoopM], info->unroll[LoopN], info->wg[LoopM],

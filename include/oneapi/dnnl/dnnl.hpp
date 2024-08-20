@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -545,9 +545,7 @@ inline dnnl_normalization_flags_t convert_to_c(normalization_flags flags) {
 /// RNN cell flags.
 enum class rnn_flags : unsigned {
     /// Undefined RNN flags
-    undef = dnnl_rnn_flags_undef,
-    /// Do not add weights gradient to existing diff_weights memory
-    diff_weights_overwrite = dnnl_rnn_flags_diff_weights_overwrite,
+    undef = dnnl_rnn_flags_undef
 };
 
 /// Converts RNN cell flags enum value from C++ API to C API type.
@@ -715,14 +713,6 @@ enum class query {
     inner_blks = dnnl_query_inner_blks,
     /// vector of logical indices of the blocks
     inner_idxs = dnnl_query_inner_idxs,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-    /// Sparse encoding
-    sparse_encoding = dnnl_query_sparse_encoding,
-    /// Number of non-zero entries
-    nnz_s64 = dnnl_query_nnz_s64,
-    /// Number of buffers required for a memory descriptor
-    num_handles_s32 = dnnl_query_num_handles_s32,
-#endif
 };
 
 /// Converts query enum value from C++ API to C API type.
@@ -866,23 +856,9 @@ struct memory : public handle<dnnl_memory_t> {
         /// A tensor in a generic format described by the stride and blocking
         /// values in each dimension.
         blocked = dnnl_blocked,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-        /// Format kind for sparse tensors.
-        sparse = dnnl_format_kind_sparse,
-#endif
         /// A special format kind that indicates that tensor format is opaque.
         opaque = dnnl_format_kind_opaque,
     };
-
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-    /// Sparse encodings.
-    enum class sparse_encoding {
-            /// Undefined sparse encoding kind, used for empty memory descriptors.
-            undef = dnnl_sparse_encoding_undef,
-            /// Compressed Sparse Row (CSR) encoding.
-            csr = dnnl_csr,
-    };
-#endif
 
     /// Memory format tag specification.
     ///
@@ -1158,7 +1134,6 @@ struct memory : public handle<dnnl_memory_t> {
 
         AB16b16a = dnnl_AB16b16a,
         AB16b32a = dnnl_AB16b32a,
-        AB16b48a = dnnl_AB16b48a,
         AB16b64a = dnnl_AB16b64a,
         AB8b16a2b = dnnl_AB8b16a2b,
         AB8b32a2b = dnnl_AB8b32a2b,
@@ -1181,7 +1156,6 @@ struct memory : public handle<dnnl_memory_t> {
         aBc32b = dnnl_aBc32b,
         ABc16b16a = dnnl_ABc16b16a,
         ABc16b32a = dnnl_ABc16b32a,
-        ABc16b48a = dnnl_ABc16b48a,
         ABc16b64a = dnnl_ABc16b64a,
         Abc4a = dnnl_Abc4a,
         aBc4b = dnnl_aBc4b,
@@ -1215,7 +1189,6 @@ struct memory : public handle<dnnl_memory_t> {
         aBcd32b = dnnl_aBcd32b,
         ABcd16b16a = dnnl_ABcd16b16a,
         ABcd16b32a = dnnl_ABcd16b32a,
-        ABcd16b48a = dnnl_ABcd16b48a,
         ABcd16b64a = dnnl_ABcd16b64a,
         aBCd16b16c = dnnl_aBCd16b16c,
         aBCd16c16b = dnnl_aBCd16c16b,
@@ -1266,7 +1239,6 @@ struct memory : public handle<dnnl_memory_t> {
         aBcde32b = dnnl_aBcde32b,
         ABcde16b16a = dnnl_ABcde16b16a,
         ABcde16b32a = dnnl_ABcde16b32a,
-        ABcde16b48a = dnnl_ABcde16b48a,
         ABcde16b64a = dnnl_ABcde16b64a,
         aBCde16b16c = dnnl_aBCde16b16c,
         aBCde16c16b = dnnl_aBCde16c16b,
@@ -1326,25 +1298,17 @@ struct memory : public handle<dnnl_memory_t> {
         aBdc16b = dnnl_aBdc16b,
         aBdc4b = dnnl_aBdc4b,
         aBdc8b = dnnl_aBdc8b,
-        aBdC8b2c = dnnl_aBdC8b2c,
-        aBdC8b4c = dnnl_aBdC8b4c,
         aBdec16b = dnnl_aBdec16b,
         aBdec4b = dnnl_aBdec4b,
         aBdec8b = dnnl_aBdec8b,
-        aBdeC8b2c = dnnl_aBdeC8b2c,
-        aBdeC8b4c = dnnl_aBdeC8b4c,
         aBdefc16b = dnnl_aBdefc16b,
         aCBdef16c16b = dnnl_aCBdef16c16b,
         aCBdef16b16c = dnnl_aCBdef16b16c,
         aBdefc4b = dnnl_aBdefc4b,
         aBdefc8b = dnnl_aBdefc8b,
-        aBdefC8b2c = dnnl_aBdefC8b2c,
-        aBdefC8b4c = dnnl_aBdefC8b4c,
         Acb16a = dnnl_Acb16a,
         Acb4a = dnnl_Acb4a,
         Acb8a = dnnl_Acb8a,
-        AcB8a2b = dnnl_AcB8a2b,
-        AcB8a4b = dnnl_AcB8a4b,
         aCBd16b16c = dnnl_aCBd16b16c,
         aCBd16c16b = dnnl_aCBd16c16b,
         aCBde16b16c = dnnl_aCBde16b16c,
@@ -1352,13 +1316,9 @@ struct memory : public handle<dnnl_memory_t> {
         Acdb16a = dnnl_Acdb16a,
         Acdb4a = dnnl_Acdb4a,
         Acdb8a = dnnl_Acdb8a,
-        AcdB8a2b = dnnl_AcdB8a2b,
-        AcdB8a4b = dnnl_AcdB8a4b,
         Acdeb16a = dnnl_Acdeb16a,
         Acdeb4a = dnnl_Acdeb4a,
         Acdeb8a = dnnl_Acdeb8a,
-        AcdeB8a2b = dnnl_AcdeB8a2b,
-        AcdeB8a4b = dnnl_AcdeB8a4b,
         BAc16a16b = dnnl_BAc16a16b,
         BAc16b16a = dnnl_BAc16b16a,
         BAcd16a16b = dnnl_BAcd16a16b,
@@ -1386,15 +1346,12 @@ struct memory : public handle<dnnl_memory_t> {
         AB32a32b8a2b = dnnl_AB32a32b8a2b,
         AB8a4b = dnnl_AB8a4b,
         AB8a2b = dnnl_AB8a2b,
-        abDc16d = dnnl_abDc16d,
         abDc32d = dnnl_abDc32d,
         abDC32d4c = dnnl_abDC32d4c,
         abCd32c = dnnl_abCd32c,
-        abdEc16e = dnnl_abdEc16e,
         abdEc32e = dnnl_abdEc32e,
         abdEC32e2c = dnnl_abdEC32e2c,
         abdEC32e4c = dnnl_abdEC32e4c,
-        abdCe16c = dnnl_abdCe16c,
         abdCe32c = dnnl_abdCe32c,
         abdCE32c2e = dnnl_abdCE32c2e,
         aBCdef16c16b4c = dnnl_aBCdef16c16b4c,
@@ -1538,37 +1495,6 @@ struct memory : public handle<dnnl_memory_t> {
         aCB16b32c4b = dnnl_aCB16b32c4b,
         aCB16b48c4b = dnnl_aCB16b48c4b,
         aCB16b64c4b = dnnl_aCB16b64c4b,
-        Acb24a = dnnl_Acb24a,
-        Acdb24a = dnnl_Acdb24a,
-        Acdeb24a = dnnl_Acdeb24a,
-        aBdc24b = dnnl_aBdc24b,
-        aBdec24b = dnnl_aBdec24b,
-        aBdefc24b = dnnl_aBdefc24b,
-        AcB24a2b = dnnl_AcB24a2b,
-        AcdB24a2b = dnnl_AcdB24a2b,
-        AcdeB24a2b = dnnl_AcdeB24a2b,
-        aBdC24b2c = dnnl_aBdC24b2c,
-        aBdeC24b2c = dnnl_aBdeC24b2c,
-        aBdefC24b2c = dnnl_aBdefC24b2c,
-        AcB24a4b = dnnl_AcB24a4b,
-        AcdB24a4b = dnnl_AcdB24a4b,
-        AcdeB24a4b = dnnl_AcdeB24a4b,
-        aBdC24b4c = dnnl_aBdC24b4c,
-        aBdeC24b4c = dnnl_aBdeC24b4c,
-        aBdefC24b4c = dnnl_aBdefC24b4c,
-        AB8b32a = dnnl_AB8b32a,
-        ABc8b32a = dnnl_ABc8b32a,
-        ABcd8b32a = dnnl_ABcd8b32a,
-        ABcde8b32a = dnnl_ABcde8b32a,
-        AB8b24a = dnnl_AB8b24a,
-        ABc8b24a = dnnl_ABc8b24a,
-        ABcd8b24a = dnnl_ABcd8b24a,
-        ABcde8b24a = dnnl_ABcde8b24a,
-        AB8b16a = dnnl_AB8b16a,
-        ABc8b16a = dnnl_ABc8b16a,
-        ABcd8b16a = dnnl_ABcd8b16a,
-        ABcde8b16a = dnnl_ABcde8b16a,
-        AB8b8a = dnnl_AB8b8a,
 
         format_tag_last = dnnl_format_tag_last,
 
@@ -1589,14 +1515,11 @@ struct memory : public handle<dnnl_memory_t> {
         IOhw16i16o = dnnl_IOhw16i16o,
         OI16i16o = dnnl_OI16i16o,
         OI16i32o = dnnl_OI16i32o,
-        OI16i48o = dnnl_OI16i48o,
         OI16i64o = dnnl_OI16i64o,
         OI8i16o2i = dnnl_OI8i16o2i,
         OI8i32o2i = dnnl_OI8i32o2i,
         OI8i64o2i = dnnl_OI8i64o2i,
-        OI4i8o4i = dnnl_OI4i8o4i,
         OI4i16o4i = dnnl_OI4i16o4i,
-        OI4i24o4i = dnnl_OI4i24o4i,
         OI4i32o4i = dnnl_OI4i32o4i,
         OI4i64o4i = dnnl_OI4i64o4i,
         Ohwi32o = dnnl_Ohwi32o,
@@ -1607,15 +1530,12 @@ struct memory : public handle<dnnl_memory_t> {
         IOw16o16i = dnnl_IOw16o16i,
         OIw16i16o = dnnl_OIw16i16o,
         OIw16i32o = dnnl_OIw16i32o,
-        OIw16i48o = dnnl_OIw16i48o,
         OIw16i64o = dnnl_OIw16i64o,
         IOw16i16o = dnnl_IOw16i16o,
         gIOw16i16o = dnnl_gIOw16i16o,
         OIw16o16i = dnnl_OIw16o16i,
         Oiw16o = dnnl_Oiw16o,
-        OIw4i8o4i = dnnl_OIw4i8o4i,
         OIw4i16o4i = dnnl_OIw4i16o4i,
-        OIw4i24o4i = dnnl_OIw4i24o4i,
         OIw4i32o4i = dnnl_OIw4i32o4i,
         OIw4i64o4i = dnnl_OIw4i64o4i,
         OIw2i8o4i = dnnl_OIw2i8o4i,
@@ -1645,8 +1565,6 @@ struct memory : public handle<dnnl_memory_t> {
         IwO16i4o = dnnl_IwO16i4o,
         Owi4o = dnnl_Owi4o,
         Owi8o = dnnl_Owi8o,
-        OwI8o2i = dnnl_OwI8o2i,
-        OwI8o4i = dnnl_OwI8o4i,
         IOhw16o16i = dnnl_IOhw16o16i,
         Ohwi16o = dnnl_Ohwi16o,
         OhwI16o2i = dnnl_OhwI16o2i,
@@ -1655,17 +1573,12 @@ struct memory : public handle<dnnl_memory_t> {
         IhwO16i4o = dnnl_IhwO16i4o,
         Ohwi4o = dnnl_Ohwi4o,
         Ohwi8o = dnnl_Ohwi8o,
-        OhwI8o2i = dnnl_OhwI8o2i,
-        OhwI8o4i = dnnl_OhwI8o4i,
         OIhw16i16o = dnnl_OIhw16i16o,
         OIhw16i32o = dnnl_OIhw16i32o,
-        OIhw16i48o = dnnl_OIhw16i48o,
         OIhw16i64o = dnnl_OIhw16i64o,
         OIhw16o16i = dnnl_OIhw16o16i,
         Oihw16o = dnnl_Oihw16o,
-        OIhw4i8o4i = dnnl_OIhw4i8o4i,
         OIhw4i16o4i = dnnl_OIhw4i16o4i,
-        OIhw4i24o4i = dnnl_OIhw4i24o4i,
         OIhw4i32o4i = dnnl_OIhw4i32o4i,
         OIhw4i64o4i = dnnl_OIhw4i64o4i,
         OIhw4i4o = dnnl_OIhw4i4o,
@@ -1687,11 +1600,8 @@ struct memory : public handle<dnnl_memory_t> {
         IdhwO16i4o = dnnl_IdhwO16i4o,
         Odhwi4o = dnnl_Odhwi4o,
         Odhwi8o = dnnl_Odhwi8o,
-        OdhwI8o2i = dnnl_OdhwI8o2i,
-        OdhwI8o4i = dnnl_OdhwI8o4i,
         OIdhw16i16o = dnnl_OIdhw16i16o,
         OIdhw16i32o = dnnl_OIdhw16i32o,
-        OIdhw16i48o = dnnl_OIdhw16i48o,
         OIdhw16i64o = dnnl_OIdhw16i64o,
         OIdhw16o16i = dnnl_OIdhw16o16i,
         OIdhw16o16i2o = dnnl_OIdhw16o16i2o,
@@ -1702,7 +1612,6 @@ struct memory : public handle<dnnl_memory_t> {
         OIdhw8i16o2i = dnnl_OIdhw8i16o2i,
         OIdhw8i32o2i = dnnl_OIdhw8i32o2i,
         OIdhw8i64o2i = dnnl_OIdhw8i64o2i,
-        OIdhw4i8o4i = dnnl_OIdhw4i8o4i,
         OIdhw4i16o4i = dnnl_OIdhw4i16o4i,
         OIdhw16i16o4i = dnnl_OIdhw16i16o4i,
         OIdhw16i32o4i = dnnl_OIdhw16i32o4i,
@@ -1712,7 +1621,6 @@ struct memory : public handle<dnnl_memory_t> {
         OIdhw16i32o2i = dnnl_OIdhw16i32o2i,
         OIdhw16i48o2i = dnnl_OIdhw16i48o2i,
         OIdhw16i64o2i = dnnl_OIdhw16i64o2i,
-        OIdhw4i24o4i = dnnl_OIdhw4i24o4i,
         OIdhw4i32o4i = dnnl_OIdhw4i32o4i,
         OIdhw4i64o4i = dnnl_OIdhw4i64o4i,
         OIdhw2i8o4i = dnnl_OIdhw2i8o4i,
@@ -1743,8 +1651,6 @@ struct memory : public handle<dnnl_memory_t> {
         gIwO16i4o = dnnl_gIwO16i4o,
         gOwi4o = dnnl_gOwi4o,
         gOwi8o = dnnl_gOwi8o,
-        gOwI8o2i = dnnl_gOwI8o2i,
-        gOwI8o4i = dnnl_gOwI8o4i,
         Goiw8g = dnnl_Goiw8g,
         Goiw16g = dnnl_Goiw16g,
         gIOhw16o16i = dnnl_gIOhw16o16i,
@@ -1755,8 +1661,6 @@ struct memory : public handle<dnnl_memory_t> {
         gIhwO16i4o = dnnl_gIhwO16i4o,
         gOhwi4o = dnnl_gOhwi4o,
         gOhwi8o = dnnl_gOhwi8o,
-        gOhwI8o2i = dnnl_gOhwI8o2i,
-        gOhwI8o4i = dnnl_gOhwI8o4i,
         Goihw16g = dnnl_Goihw16g,
         gOIhw16i16o = dnnl_gOIhw16i16o,
         gOIhw16o16i = dnnl_gOIhw16o16i,
@@ -1801,8 +1705,6 @@ struct memory : public handle<dnnl_memory_t> {
         gIdhwO16i4o = dnnl_gIdhwO16i4o,
         gOdhwi4o = dnnl_gOdhwi4o,
         gOdhwi8o = dnnl_gOdhwi8o,
-        gOdhwI8o2i = dnnl_gOdhwI8o2i,
-        gOdhwI8o4i = dnnl_gOdhwI8o4i,
         gOIdhw16i16o = dnnl_gOIdhw16i16o,
         gOIdhw16o16i = dnnl_gOIdhw16o16i,
         gOIdhw16o16i2o = dnnl_gOIdhw16o16i2o,
@@ -1830,11 +1732,8 @@ struct memory : public handle<dnnl_memory_t> {
         gOIw4o8i2o = dnnl_gOIw4o8i2o,
         gOIhw4o8i2o = dnnl_gOIhw4o8i2o,
         gOIdhw4o8i2o = dnnl_gOIdhw4o8i2o,
-
-        ldOi16o = abDc16d,
         ldOi32o = abDc32d,
         ldOI32o4i = abDC32d4c,
-        ldgOi16o = abdEc16e,
         ldgOi32o = abdEc32e,
         ldgOI32o2i = abdEC32e2c,
         ldgOI32o4i = abdEC32e4c,
@@ -1969,7 +1868,6 @@ struct memory : public handle<dnnl_memory_t> {
         gdhwIo2i = dnnl_gdhwIo2i,
         gdhwIo4i = dnnl_gdhwIo4i,
         ldIo32i = dnnl_ldIo32i,
-        ldgIo16i = dnnl_ldgIo16i,
         ldgIo32i = dnnl_ldgIo32i,
         ldgIO32i2o = dnnl_ldgIO32i2o,
         nCdhw32c = dnnl_nCdhw32c,
@@ -2418,123 +2316,6 @@ struct memory : public handle<dnnl_memory_t> {
         woi = dnnl_woi,
         hwoi = dnnl_hwoi,
         dhwoi = dnnl_dhwoi,
-        Owi24o = dnnl_Owi24o,
-        Ohwi24o = dnnl_Ohwi24o,
-        Odhwi24o = dnnl_Odhwi24o,
-        gOwi24o = dnnl_gOwi24o,
-        gOhwi24o = dnnl_gOhwi24o,
-        gOdhwi24o = dnnl_gOdhwi24o,
-        OwI24o2i = dnnl_OwI24o2i,
-        OhwI24o2i = dnnl_OhwI24o2i,
-        OdhwI24o2i = dnnl_OdhwI24o2i,
-        gOwI24o2i = dnnl_gOwI24o2i,
-        gOhwI24o2i = dnnl_gOhwI24o2i,
-        gOdhwI24o2i = dnnl_gOdhwI24o2i,
-        OwI24o4i = dnnl_OwI24o4i,
-        OhwI24o4i = dnnl_OhwI24o4i,
-        OdhwI24o4i = dnnl_OdhwI24o4i,
-        gOwI24o4i = dnnl_gOwI24o4i,
-        gOhwI24o4i = dnnl_gOhwI24o4i,
-        gOdhwI24o4i = dnnl_gOdhwI24o4i,
-        OI8i32o = dnnl_OI8i32o,
-        OIw8i32o = dnnl_OIw8i32o,
-        OIhw8i32o = dnnl_OIhw8i32o,
-        OIdhw8i32o = dnnl_OIdhw8i32o,
-        OI8i24o = dnnl_OI8i24o,
-        OIw8i24o = dnnl_OIw8i24o,
-        OIhw8i24o = dnnl_OIhw8i24o,
-        OIdhw8i24o = dnnl_OIdhw8i24o,
-        OI8i16o = dnnl_OI8i16o,
-        OIw8i16o = dnnl_OIw8i16o,
-        OIhw8i16o = dnnl_OIhw8i16o,
-        OIdhw8i16o = dnnl_OIdhw8i16o,
-        OI8i8o = dnnl_OI8i8o,
-        AB4b8a4b = dnnl_AB4b8a4b,
-        AB4b24a4b = dnnl_AB4b24a4b,
-        ABc4b8a4b = dnnl_ABc4b8a4b,
-        ABc4b24a4b = dnnl_ABc4b24a4b,
-        ABcd4b8a4b = dnnl_ABcd4b8a4b,
-        ABcd4b24a4b = dnnl_ABcd4b24a4b,
-        ABcde4b8a4b = dnnl_ABcde4b8a4b,
-        ABcde4b24a4b = dnnl_ABcde4b24a4b,
-        Bca8b = dnnl_Bca8b,
-        BcA8b2a = dnnl_BcA8b2a,
-        Bcda8b = dnnl_Bcda8b,
-        BcdA8b2a = dnnl_BcdA8b2a,
-        Bcdea8b = dnnl_Bcdea8b,
-        BcdeA8b2a = dnnl_BcdeA8b2a,
-        aCdb8c = dnnl_aCdb8c,
-        aCdB8c2b = dnnl_aCdB8c2b,
-        aCdeb8c = dnnl_aCdeb8c,
-        aCdeB8c2b = dnnl_aCdeB8c2b,
-        aCdefb8c = dnnl_aCdefb8c,
-        aCdefB8c2b = dnnl_aCdefB8c2b,
-        Bca24b = dnnl_Bca24b,
-        BcA24b2a = dnnl_BcA24b2a,
-        Bcda24b = dnnl_Bcda24b,
-        BcdA24b2a = dnnl_BcdA24b2a,
-        Bcdea24b = dnnl_Bcdea24b,
-        BcdeA24b2a = dnnl_BcdeA24b2a,
-        aCdb24c = dnnl_aCdb24c,
-        aCdB24c2b = dnnl_aCdB24c2b,
-        aCdeb24c = dnnl_aCdeb24c,
-        aCdeB24c2b = dnnl_aCdeB24c2b,
-        aCdefb24c = dnnl_aCdefb24c,
-        aCdefB24c2b = dnnl_aCdefB24c2b,
-        Iwo8i = dnnl_Iwo8i,
-        IwO8i2o = dnnl_IwO8i2o,
-        Iwo24i = dnnl_Iwo24i,
-        IwO24i2o = dnnl_IwO24i2o,
-        Ihwo8i = dnnl_Ihwo8i,
-        IhwO8i2o = dnnl_IhwO8i2o,
-        Ihwo24i = dnnl_Ihwo24i,
-        IhwO24i2o = dnnl_IhwO24i2o,
-        Idhwo8i = dnnl_Idhwo8i,
-        IdhwO8i2o = dnnl_IdhwO8i2o,
-        Idhwo24i = dnnl_Idhwo24i,
-        IdhwO24i2o = dnnl_IdhwO24i2o,
-        gIwo8i = dnnl_gIwo8i,
-        gIwO8i2o = dnnl_gIwO8i2o,
-        gIwo24i = dnnl_gIwo24i,
-        gIwO24i2o = dnnl_gIwO24i2o,
-        gIhwo8i = dnnl_gIhwo8i,
-        gIhwO8i2o = dnnl_gIhwO8i2o,
-        gIhwo24i = dnnl_gIhwo24i,
-        gIhwO24i2o = dnnl_gIhwO24i2o,
-        gIdhwo8i = dnnl_gIdhwo8i,
-        gIdhwO8i2o = dnnl_gIdhwO8i2o,
-        gIdhwo24i = dnnl_gIdhwo24i,
-        gIdhwO24i2o = dnnl_gIdhwO24i2o,
-        OhwI24o = dnnl_OhwI24o,
-        gOhwI24o = dnnl_gOhwI24o,
-        AB8b24a2b = dnnl_AB8b24a2b,
-        ABc8b24a2b = dnnl_ABc8b24a2b,
-        ABcd8b24a2b = dnnl_ABcd8b24a2b,
-        ABcde8b24a2b = dnnl_ABcde8b24a2b,
-        AB8b8a2b = dnnl_AB8b8a2b,
-        ABc8b8a2b = dnnl_ABc8b8a2b,
-        ABcd8b8a2b = dnnl_ABcd8b8a2b,
-        ABcde8b8a2b = dnnl_ABcde8b8a2b,
-        OI8i8o2i = dnnl_OI8i8o2i,
-        OI8i24o2i = dnnl_OI8i24o2i,
-        OIw8i8o2i = dnnl_OIw8i8o2i,
-        OIw8i24o2i = dnnl_OIw8i24o2i,
-        OIhw8i8o2i = dnnl_OIhw8i8o2i,
-        OIhw8i24o2i = dnnl_OIhw8i24o2i,
-        OIdhw8i8o2i = dnnl_OIdhw8i8o2i,
-        OIdhw8i24o2i = dnnl_OIdhw8i24o2i,
-        BcA8b4a = dnnl_BcA8b4a,
-        BcdA8b4a = dnnl_BcdA8b4a,
-        BcdeA8b4a = dnnl_BcdeA8b4a,
-        aCdB8c4b = dnnl_aCdB8c4b,
-        aCdeB8c4b = dnnl_aCdeB8c4b,
-        aCdefB8c4b = dnnl_aCdefB8c4b,
-        BcA24b4a = dnnl_BcA24b4a,
-        BcdA24b4a = dnnl_BcdA24b4a,
-        BcdeA24b4a = dnnl_BcdeA24b4a,
-        aCdB24c4b = dnnl_aCdB24c4b,
-        aCdeB24c4b = dnnl_aCdeB24c4b,
-        aCdefB24c4b = dnnl_aCdefB24c4b,
     };
 
     /// A memory descriptor.
@@ -2612,41 +2393,7 @@ struct memory : public handle<dnnl_memory_t> {
                         "strides");
             reset(md);
         }
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-        /// Function for creating a memory descriptor for CSR sparse encoding.
-        ///
-        /// The created memory descriptor will describe a memory object that
-        /// contains 3 buffers. The buffers have the following meaning and
-        /// assigned numbers (index):
-        ///  - 0: values
-        ///  - 1: indices
-        ///  - 2: pointers
-        ///
-        /// @param adims Tensor dimensions.
-        /// @param adata_type Data precision/type.
-        /// @param nnz Number of non-zero entries.
-        /// @param index_dt Data type of indices.
-        /// @param pointer_dt Data type of pointers.
-        /// @param allow_empty A flag signifying whether construction is
-        ///     allowed to fail without throwing an exception. In this case a
-        ///     zero memory descriptor will be constructed. This flag is
-        ///     optional and defaults to false.
-        static desc csr(const dims &adims, data_type adata_type, dim nnz,
-                data_type index_dt, data_type pointer_dt,
-                bool allow_empty = false) {
-            validate_dims(adims);
-            dnnl_memory_desc_t md = nullptr;
-            dnnl_status_t status = dnnl_memory_desc_create_with_csr_encoding(
-                    &md, (int)adims.size(), adims.data(),
-                    convert_to_c(adata_type), nnz, convert_to_c(index_dt),
-                    convert_to_c(pointer_dt));
-            if (!allow_empty)
-                error::wrap_c_api(status,
-                        "could not create a memory descriptor for CSR sparse "
-                        "encoding");
-            return desc {md};
-        }
-#endif
+
         /// Construct a memory descriptor from a C API ::dnnl_memory_desc_t
         /// handle. The resulting handle is not weak and the C handle will be
         /// destroyed during the destruction of the C++ object.
@@ -2858,55 +2605,6 @@ struct memory : public handle<dnnl_memory_t> {
             return query_dims(query::inner_idxs);
         }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-        /// Returns number of handles.
-        ///
-        /// @returns A number of handles.
-        int get_num_handles() const {
-            int nhandles;
-            dnnl_status_t status = dnnl_memory_desc_query_v2(
-                    get(), dnnl_query_num_handles_s32, 0, &nhandles);
-            return status == dnnl_success ? nhandles : 0;
-        }
-
-        /// Returns a number of non-zero entries of the memory descriptor.
-        ///
-        /// @returns A number non-zero entries.
-        dim get_nnz() const {
-            dnnl_dim_t nnz;
-            dnnl_status_t status = dnnl_memory_desc_query_v2(
-                    get(), dnnl_query_nnz_s64, 0, &nnz);
-            return status == dnnl_success ? nnz : 0;
-        }
-
-        /// Returns the sparse encoding of the memory descriptor.
-        ///
-        /// @returns the sparse encoding kind.
-        memory::sparse_encoding get_sparse_encoding() const {
-            dnnl_sparse_encoding_t sparse_encoding;
-            dnnl_status_t status = dnnl_memory_desc_query_v2(
-                    get(), dnnl_query_sparse_encoding, 0, &sparse_encoding);
-            return status == dnnl_success
-                    ? static_cast<dnnl::memory::sparse_encoding>(
-                            sparse_encoding)
-                    : dnnl::memory::sparse_encoding::undef;
-        }
-
-        /// Returns the data type of the memory descriptor.
-        ///
-        /// @returns The data type.
-        memory::data_type get_data_type(int index = 0) const {
-            return query_data_type(query::data_type, index);
-        }
-#else
-        /// Returns the data type of the memory descriptor.
-        ///
-        /// @returns The data type.
-        memory::data_type get_data_type() const {
-            return query_data_type(query::data_type);
-        }
-#endif
-
         /// Returns the format kind of the memory descriptor.
         ///
         /// @returns the format kind.
@@ -2919,28 +2617,29 @@ struct memory : public handle<dnnl_memory_t> {
                     : dnnl::memory::format_kind::undef;
         }
 
+        /// Returns the data type of the memory descriptor.
+        ///
+        /// @returns The data type.
+        memory::data_type get_data_type() const {
+            dnnl_data_type_t data_type;
+            dnnl_status_t status = dnnl_memory_desc_query(
+                    get(), dnnl_query_data_type, &data_type);
+            return status == dnnl_success
+                    ? static_cast<dnnl::memory::data_type>(data_type)
+                    : dnnl::memory::data_type::undef;
+        }
+
         /// Returns dimensions of the memory descriptor.
         ///
         /// Potentially expensive due to the data copy involved.
         /// @returns A copy of the dimensions vector.
         memory::dims get_dims() const { return query_dims(query::dims); }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-        /// Returns size of the memory descriptor in bytes.
-        /// @param index Data index. Defaults to 0.
-        /// @returns The number of bytes required to allocate a memory buffer
-        ///     for data with a particular @p index described by this memory
-        ///     descriptor including the padding area.
-        size_t get_size(int index = 0) const {
-            return dnnl_memory_desc_get_size_v2(get(), index);
-        }
-#else
         /// Returns size of the memory descriptor in bytes.
         /// @returns The number of bytes required to allocate a memory buffer
         ///     for the memory object described by this memory descriptor
         ///     including the padding area.
         size_t get_size() const { return dnnl_memory_desc_get_size(get()); }
-#endif
 
         /// Checks whether the memory descriptor is zero (empty).
         /// @returns @c true if the memory descriptor describes an empty
@@ -2962,26 +2661,6 @@ struct memory : public handle<dnnl_memory_t> {
         bool operator!=(const desc &other) const { return !operator==(other); }
 
     private:
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-        memory::data_type query_data_type(query what, int index) const {
-            dnnl_data_type_t data_type;
-            dnnl_status_t status = dnnl_memory_desc_query_v2(
-                    get(), dnnl::convert_to_c(what), index, &data_type);
-            return status == dnnl_success
-                    ? static_cast<dnnl::memory::data_type>(data_type)
-                    : dnnl::memory::data_type::undef;
-        }
-#else
-        memory::data_type query_data_type(query what) const {
-            dnnl_data_type_t data_type;
-            dnnl_status_t status = dnnl_memory_desc_query(
-                    get(), dnnl::convert_to_c(what), &data_type);
-            return status == dnnl_success
-                    ? static_cast<dnnl::memory::data_type>(data_type)
-                    : dnnl::memory::data_type::undef;
-        }
-#endif
-
         int query_s32(query what) const {
             int res;
             dnnl_status_t status = dnnl_memory_desc_query(
@@ -3011,76 +2690,6 @@ struct memory : public handle<dnnl_memory_t> {
     /// absence of a parameter.
     memory() = default;
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-    /// Constructs a memory object.
-    ///
-    /// Unless @p handle is equal to #DNNL_MEMORY_NONE, the constructed memory
-    /// object will have the underlying buffer set. In this case, the buffer
-    /// will be initialized as if #dnnl::memory::set_data_handle() had been
-    /// called.
-    ///
-    /// @sa memory::set_data_handle()
-    ///
-    /// @param md Memory descriptor.
-    /// @param aengine Engine to store the data on.
-    /// @param handle Handle of the memory buffer to use.
-    ///     - A pointer to the user-allocated buffer. In this case the library
-    ///       doesn't own the buffer.
-    ///     - The #DNNL_MEMORY_ALLOCATE special value. Instructs the library to
-    ///       allocate the buffer for the memory object. In this case the
-    ///       library owns the buffer.
-    ///     - #DNNL_MEMORY_NONE to create dnnl::memory without an underlying
-    ///       buffer.
-    memory(const desc &md, const engine &aengine, void *handle)
-        : memory(md, aengine, std::vector<void *> {handle}) {}
-
-    /// Constructs a memory object with multiple handles.
-    ///
-    /// Unless @p handle is equal to #DNNL_MEMORY_NONE, the constructed memory
-    /// object will have the underlying buffer set. In this case, the buffer
-    /// will be initialized as if #dnnl::memory::set_data_handle() had been
-    /// called.
-    ///
-    /// @sa memory::set_data_handle()
-    ///
-    /// @param md Memory descriptor.
-    /// @param aengine Engine to store the data on.
-    /// @param handles Handles of the memory buffers to use.
-    ///     For each element of the @p handles vector the following applies:
-    ///     - A pointer to the user-allocated buffer. In this case the library
-    ///       doesn't own the buffer.
-    ///     - The #DNNL_MEMORY_ALLOCATE special value. Instructs the library to
-    ///       allocate the buffer for the memory object. In this case the
-    ///       library owns the buffer.
-    ///     - #DNNL_MEMORY_NONE Instructs the library to skip allocation of the
-    ///       memory buffer.
-    memory(const desc &md, const engine &aengine, std::vector<void *> handles) {
-        dnnl_memory_t result;
-        dnnl_status_t status = dnnl_memory_create_v2(&result, md.get(),
-                aengine.get(), (int)handles.size(), handles.data());
-        error::wrap_c_api(status, "could not create a memory object");
-        reset(result);
-    }
-
-    /// Constructs a memory object.
-    ///
-    /// The underlying buffer(s) for the memory will be allocated by the
-    /// library.
-    /// @param md Memory descriptor.
-    /// @param aengine Engine to store the data on.
-    memory(const desc &md, const engine &aengine) {
-        dnnl_status_t status;
-        dnnl_memory_t result;
-        const int nhandles = md.get_num_handles();
-
-        std::vector<void *> handles(nhandles, DNNL_MEMORY_ALLOCATE);
-        status = dnnl_memory_create_v2(&result, md.get(), aengine.get(),
-                (int)handles.size(), handles.data());
-
-        error::wrap_c_api(status, "could not create a memory object");
-        reset(result);
-    }
-#else
     /// Constructs a memory object.
     ///
     /// Unless @p handle is equal to #DNNL_MEMORY_NONE, the constructed memory
@@ -3116,7 +2725,6 @@ struct memory : public handle<dnnl_memory_t> {
     /// @param aengine Engine to store the data on.
     memory(const desc &md, const engine &aengine)
         : memory(md, aengine, DNNL_MEMORY_ALLOCATE) {}
-#endif
 
     /// Returns the associated memory descriptor.
     desc get_desc() const {
@@ -3137,78 +2745,6 @@ struct memory : public handle<dnnl_memory_t> {
         return engine(c_engine, true);
     }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-    /// Returns an underlying memory buffer that corresponds to the given index.
-    ///
-    /// On the CPU engine, or when using USM, this is a pointer to the
-    /// allocated memory.
-    void *get_data_handle(int index = 0) const {
-        void *handle;
-        error::wrap_c_api(dnnl_memory_get_data_handle_v2(get(), &handle, index),
-                "could not get a native handle from a memory object");
-        return handle;
-    }
-
-    /// Sets an underlying memory buffer that corresponds to the given index.
-    ///
-    /// @param handle Memory buffer to use. On the CPU engine or when USM is
-    ///     used, the memory buffer is a pointer to the actual data. For OpenCL
-    ///     it is a cl_mem. It must have at least
-    ///     #dnnl::memory::desc::get_size() bytes allocated.
-    /// @param index Memory index to attach the buffer. Defaults to 0.
-    void set_data_handle(void *handle, int index = 0) const {
-        error::wrap_c_api(dnnl_memory_set_data_handle_v2(get(), handle, index),
-                "could not set native handle of a memory object");
-    }
-
-    /// Maps a memory object and returns a host-side pointer to a memory
-    /// buffer with a copy of its contents. The memory buffer corresponds to
-    /// the given index.
-    ///
-    /// Mapping enables read/write directly from/to the memory contents for
-    /// engines that do not support direct memory access.
-    ///
-    /// Mapping is an exclusive operation - a memory object cannot be used in
-    /// other operations until it is unmapped via #dnnl::memory::unmap_data()
-    /// call.
-    ///
-    /// @note
-    ///     Any primitives working with the memory should be completed before
-    ///     the memory is mapped. Use #dnnl::stream::wait() to synchronize the
-    ///     corresponding execution stream.
-    ///
-    /// @note
-    ///     The map_data and unmap_data functions are provided mainly for
-    ///     debug and testing purposes and their performance may be suboptimal.
-    ///
-    /// @tparam T Data type to return a pointer to.
-    /// @param index Index of the buffer. Defaults to 0.
-    /// @returns Pointer to the mapped memory.
-    template <typename T = void>
-    T *map_data(int index = 0) const {
-        void *mapped_ptr;
-        error::wrap_c_api(dnnl_memory_map_data_v2(get(), &mapped_ptr, index),
-                "could not map memory object data");
-        return static_cast<T *>(mapped_ptr);
-    }
-
-    /// Unmaps a memory object and writes back any changes made to the
-    /// previously mapped memory buffer. The memory buffer corresponds to
-    /// the given index.
-    ///
-    /// @note
-    ///     The map_data and unmap_data functions are provided mainly for
-    ///     debug and testing purposes and their performance may be
-    ///     suboptimal.
-    ///
-    /// @param mapped_ptr A pointer previously returned by
-    ///     #dnnl::memory::map_data().
-    /// @param index Index of the buffer. Defaults to 0.
-    void unmap_data(void *mapped_ptr, int index = 0) const {
-        error::wrap_c_api(dnnl_memory_unmap_data_v2(get(), mapped_ptr, index),
-                "could not unmap memory object data");
-    }
-#else
     /// Returns the underlying memory buffer.
     ///
     /// On the CPU engine, or when using USM, this is a pointer to the
@@ -3274,7 +2810,6 @@ struct memory : public handle<dnnl_memory_t> {
         error::wrap_c_api(dnnl_memory_unmap_data(get(), mapped_ptr),
                 "could not unmap memory object data");
     }
-#endif
 
     static dnnl_data_type_t convert_to_c(data_type adata_type) {
         return static_cast<dnnl_data_type_t>(adata_type);
@@ -10649,7 +10184,7 @@ struct lbr_gru_backward : public primitive {
                 const memory::desc &diff_bias_desc,
                 const memory::desc &diff_dst_layer_desc,
                 const memory::desc &diff_dst_iter_desc,
-                const lbr_gru_forward::primitive_desc &hint_fwd_pd,
+                const gru_forward::primitive_desc &hint_fwd_pd,
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : rnn_primitive_desc_base(aengine, algorithm::lbr_gru, aprop_kind,
@@ -10993,7 +10528,7 @@ struct augru_backward : public primitive {
                 const memory::desc &diff_bias_desc,
                 const memory::desc &diff_dst_layer_desc,
                 const memory::desc &diff_dst_iter_desc,
-                const augru_forward::primitive_desc &hint_fwd_pd,
+                const gru_forward::primitive_desc &hint_fwd_pd,
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : rnn_primitive_desc_base(aengine, algorithm::vanilla_augru,
@@ -11349,7 +10884,7 @@ struct lbr_augru_backward : public primitive {
                 const memory::desc &diff_bias_desc,
                 const memory::desc &diff_dst_layer_desc,
                 const memory::desc &diff_dst_iter_desc,
-                const lbr_augru_forward::primitive_desc &hint_fwd_pd,
+                const gru_forward::primitive_desc &hint_fwd_pd,
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : rnn_primitive_desc_base(aengine, algorithm::lbr_augru, aprop_kind,
@@ -12829,64 +12364,6 @@ inline cpu_isa_hints get_cpu_isa_hints() {
 }
 
 /// @} dnnl_api_service
-
-#ifdef DNNL_EXPERIMENTAL_PROFILING
-/// @addtogroup dnnl_api_profiling Profiling
-/// @{
-
-/// Profiling data kind.
-enum class profiling_data_kind {
-    /// Undefined profiling data kind.
-    undef = dnnl_profiling_data_kind_undef,
-    /// Data kind to query an execution time in nanoseconds.
-    time = dnnl_profiling_data_kind_time,
-};
-
-/// Resets a profiler's state.
-///
-/// @param stream Stream associated with the profiler.
-inline void reset_profiling(stream &stream) {
-    error::wrap_c_api(
-            dnnl_reset_profiling(stream.get()), "could not reset profiling");
-}
-
-/// Returns requested profiling data. The profiling data accumulates for each
-/// primitive execution. The size of the vector will be equal to the number
-/// of executions since the last `dnnl::reset_profiling` call.
-///
-/// The profiling data can be reset by calling #dnnl::reset_profiling.
-///
-/// @note
-///     It is required to wait for all submitted primitives to complete
-///     using #dnnl::stream::wait prior to querying profiling data.
-///
-/// @param stream Stream that was used for executing a primitive that
-///     is being profiled.
-/// @param data_kind Profiling data kind to query.
-///
-/// @returns A vector with the requested profiling data.
-inline std::vector<uint64_t> get_profiling_data(
-        stream &stream, profiling_data_kind data_kind) {
-    int num_entries = 0;
-    error::wrap_c_api(
-            dnnl_query_profiling_data(stream.get(),
-                    static_cast<dnnl_profiling_data_kind_t>(data_kind),
-                    &num_entries, nullptr),
-            "could not get number of entries for profiling data");
-
-    if (num_entries == 0) return {};
-
-    std::vector<uint64_t> data(num_entries);
-    error::wrap_c_api(
-            dnnl_query_profiling_data(stream.get(),
-                    static_cast<dnnl_profiling_data_kind_t>(data_kind),
-                    &num_entries, data.data()),
-            "could not get profiling data");
-    return data;
-}
-
-/// @} dnnl_api_profiling
-#endif
 
 /// @addtogroup dnnl_api_primitive_cache Primitive Cache
 ///

@@ -177,7 +177,6 @@ status_t replace_quant_data_with_binary_post_op(
             bin_op->add_input(in_val);
             auto out_val = quant_data_op->get_output_value(0);
             bin_op->add_output(out_val);
-            in_val->set_data_type(out_val->get_logical_tensor().data_type);
             insert_empty_scratchpad(bin_op);
 
             // add quant data as a constant input
@@ -254,7 +253,6 @@ status_t convert_to_runtime_src_scales(std::shared_ptr<subgraph_t> &sg) {
                 "scale_op should have only one output value.");
         auto out_val = cur_op->get_output_values()[0];
         auto consumers = out_val->get_consumers();
-        if (consumers.empty()) continue;
         if (!impl::utils::one_of(consumers[0].get_op().get_kind(),
                     op_kind::dnnl_matmul, op_kind::dnnl_convolution,
                     op_kind::dnnl_convtranspose, op_kind::dnnl_reorder))
@@ -461,73 +459,6 @@ status_t fold_mul_scales(std::shared_ptr<subgraph_t> &sg) {
         changed = fold_mul_scales_func();
     } while (changed);
     return status::success;
-}
-
-impl::status_t fold_sub_zps_add_zps(std::shared_ptr<subgraph_t> &sg) {
-    // lambda function to fold the consecutive zps ops
-    auto fold_zps_func = [&]() {
-        std::vector<std::pair<op_t *, op_t *>> folding_groups;
-        std::set<op_t *> visited;
-        for (const auto &cur_op : sg->get_ops()) {
-            if (cur_op->get_kind() != op_kind::dnnl_sub_zps
-                    || visited.count(cur_op.get()) != 0)
-                continue;
-
-            assertm(cur_op->num_outputs() == 1,
-                    "cur_op should have only one output value.");
-            auto out_val = cur_op->get_output_values()[0];
-            auto consumers = out_val->get_consumers();
-            if (consumers.empty()) continue;
-
-            auto &consumer_op = consumers[0].get_op();
-            if (consumer_op.get_kind() != op_kind::dnnl_add_zps) continue;
-
-            folding_groups.emplace_back(
-                    std::pair<op_t *, op_t *> {cur_op.get(), &consumer_op});
-            visited.insert(cur_op.get());
-            visited.insert(&consumer_op);
-        }
-
-        if (folding_groups.empty()) return false;
-
-        subgraph_rewriter_t rewriter(sg);
-        for (auto &folding_ops : folding_groups) {
-            auto previous_op = folding_ops.first;
-            auto base_op = folding_ops.second;
-
-            // update the scales
-            const auto &zps_previous
-                    = previous_op->get_attr<std::vector<int64_t>>(op_attr::zps);
-            const auto &zps_base
-                    = base_op->get_attr<std::vector<int64_t>>(op_attr::zps);
-            std::vector<int64_t> new_zps(
-                    std::max(zps_previous.size(), zps_base.size()), 0);
-            // per-channel -> per-tensor
-            if (zps_base.size() > zps_previous.size()) {
-                for (size_t i = 0; i < new_zps.size(); ++i)
-                    new_zps[i] = zps_base[i] - zps_previous[0];
-            } else {
-                for (size_t i = 0; i < new_zps.size(); ++i)
-                    new_zps[i] = zps_base[0] - zps_previous[i];
-                // set attrs
-                base_op->set_attr<int64_t>(op_attr::axis,
-                        previous_op->get_attr<int64_t>(op_attr::axis));
-                base_op->set_attr<std::string>(op_attr::qtype,
-                        previous_op->get_attr<std::string>(op_attr::qtype));
-            }
-            base_op->set_attr<std::vector<int64_t>>(op_attr::zps, new_zps);
-
-            rewriter.fuse_op_to_predecessor(previous_op->shared_from_this(), 0);
-        }
-        rewriter.run();
-        return true;
-    };
-
-    bool changed = true;
-    do {
-        changed = fold_zps_func();
-    } while (changed);
-    return impl::status::success;
 }
 
 // FIXME(xx) This pass works correctly only when all inputs/outputs scales/zps
@@ -885,10 +816,8 @@ status_t fuse_post_ops(std::shared_ptr<subgraph_t> &sg) {
                         1 - fuse_op_predecessor_offset);
 
                 if (other_in_val0->has_producer()
-                        && (other_in_val0->get_producer().get_kind()
-                                        == op_kind::dnnl_mul_scales
-                                || other_in_val0->get_producer().get_kind()
-                                        == op_kind::dnnl_sub_zps)) {
+                        && other_in_val0->get_producer().get_kind()
+                                == op_kind::dnnl_mul_scales) {
                     mul_scale_op_offset = 1 - fuse_op_predecessor_offset;
                 }
 
@@ -904,33 +833,28 @@ status_t fuse_post_ops(std::shared_ptr<subgraph_t> &sg) {
                     // output scales attribute and its inputs don't have
                     // same dims)
                     auto in_val = post_op->get_input_value(mul_scale_op_offset);
-                    auto &pre_op = in_val->get_producer();
-                    std::vector<float> scales {1.f};
-                    int32_t zp = 0;
-                    if (pre_op.get_kind() == op_kind::dnnl_mul_scales) {
-                        scales = pre_op.get_attr<std::vector<float>>(
-                                op_attr::scales);
-                        assert(scales.size() == 1); // per tensor
-                        auto tmp = pre_op.get_input_value(0);
+                    auto &mul_scale_op = in_val->get_producer();
+                    auto scales = mul_scale_op.get_attr<std::vector<float>>(
+                            op_attr::scales);
+                    assert(scales.size() == 1); // per tensor
 
-                        if (tmp->has_producer()
-                                && tmp->get_producer().get_kind()
-                                        == op_kind::dnnl_sub_zps) {
-                            auto &sub_op = tmp->get_producer();
-                            auto zps = sub_op.get_attr<std::vector<int64_t>>(
-                                    op_attr::zps);
-                            zp = static_cast<int32_t>(zps[0]);
-                            assert(scales.size() == zps.size());
-                            rewriter.fuse_op_to_successor(
-                                    sub_op.shared_from_this());
-                        }
-                    } else {
-                        auto zps = pre_op.get_attr<std::vector<int64_t>>(
+                    auto tmp = mul_scale_op.get_input_value(0);
+                    int32_t zp = 0;
+                    if (tmp->has_producer()
+                            && tmp->get_producer().get_kind()
+                                    == op_kind::dnnl_sub_zps) {
+                        auto &sub_zps_op = tmp->get_producer();
+                        auto zps = sub_zps_op.get_attr<std::vector<int64_t>>(
                                 op_attr::zps);
                         zp = static_cast<int32_t>(zps[0]);
                         assert(scales.size() == zps.size());
+
+                        rewriter.fuse_op_to_successor(
+                                sub_zps_op.shared_from_this());
                     }
-                    rewriter.fuse_op_to_successor(pre_op.shared_from_this());
+                    rewriter.fuse_op_to_successor(
+                            mul_scale_op.shared_from_this());
+
                     fusion_info.append_post_binary(post_op->shared_from_this(),
                             std::vector<size_t> {base_op->num_inputs()},
                             scales[0], zp);
@@ -1086,7 +1010,7 @@ status_t fuse_src_scales(std::shared_ptr<subgraph_t> &sg) {
                 "scale_op should have only one output value.");
         auto out_val = scale_op->get_output_values()[0];
         auto consumers = out_val->get_consumers();
-        if (consumers.empty()) continue;
+
         if (!impl::utils::one_of(consumers[0].get_op().get_kind(),
                     op_kind::dnnl_matmul, op_kind::dnnl_convolution,
                     op_kind::dnnl_convtranspose, op_kind::dnnl_reorder))
@@ -1272,7 +1196,6 @@ status_t fuse_dst_zero_points(std::shared_ptr<subgraph_t> &sg) {
         auto consumers = out_val->get_consumers();
 
         auto in_val = zp_op->get_input_values()[0];
-        if (!in_val->has_producer()) continue;
         auto &prv_op = in_val->get_producer();
 
         if (!has_int8_support(prv_op.get_kind())) continue;
@@ -1403,16 +1326,14 @@ status_t expand_convtranspose_scales(std::shared_ptr<subgraph_t> &sg) {
                     || in1.get_kind() != op_kind::dnnl_mul_scales)
                 continue;
 
-            if (in1.has_attr(op_attr::qtype)
-                    && in1.get_attr<std::string>(op_attr::qtype)
-                            == "per_tensor")
-                continue;
+            auto dq_src_scales
+                    = in0.get_attr<std::vector<float>>(op_attr::scales);
             auto dq_wei_scales
                     = in1.get_attr<std::vector<float>>(op_attr::scales);
             int64_t group = op->get_attr<int64_t>(op_attr::groups);
-            if (group > 1) {
+            if (dq_src_scales.size() < dq_wei_scales.size() && group > 1) {
                 // Currently for ConvTranspose, the output channel in weight tensor
-                // (IC, OC/g, H, W) is not equal to the one in output tensor
+                // (OC/g, IC, H, W) is not equal to the one in output tensor
                 // (N, OC, H, W) if `groups` > 1, so the size of weight's
                 // per-channel scale is not the same as the output channel in output
                 // tensor, here we will broadcast scales from `OC/g` to `OC`.
@@ -1446,7 +1367,7 @@ status_t conv_bwd_data_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // input permute
             auto in_ndims
                     = cur_op->get_input_value(0)->get_logical_tensor().ndims;
-            auto in_perm = get_permutation(in_ndims, "NXC", "NCX");
+            auto in_perm = get_nxc2ncx_permutation(in_ndims);
 
             op_ptr in_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             in_perm_op->set_attr<std::vector<int64_t>>(
@@ -1456,7 +1377,7 @@ status_t conv_bwd_data_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // output permute
             auto out_ndims
                     = cur_op->get_output_value(0)->get_logical_tensor().ndims;
-            auto out_perm = get_permutation(out_ndims, "NCX", "NXC");
+            auto out_perm = get_ncx2nxc_permutation(out_ndims);
 
             op_ptr out_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             out_perm_op->set_attr<std::vector<int64_t>>(
@@ -1474,7 +1395,7 @@ status_t conv_bwd_data_canonicalization(std::shared_ptr<subgraph_t> &sg) {
         if (need_permute_1) {
             auto wei_ndims
                     = cur_op->get_input_value(1)->get_logical_tensor().ndims;
-            auto wei_perm = get_permutation(wei_ndims, "XIO", "OIX");
+            auto wei_perm = get_xio2oix_permutation(wei_ndims);
 
             op_ptr perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             perm_op->set_attr<std::vector<int64_t>>(
@@ -1524,14 +1445,14 @@ status_t conv_bwd_weights_canonicalization(std::shared_ptr<subgraph_t> &sg) {
                 : false;
         bool need_permute_1 = cur_op->has_attr(op_attr::weights_format)
                 ? (cur_op->get_attr<std::string>(op_attr::weights_format)
-                        != "OIX")
+                        == "XIO")
                 : false;
 
         if (need_permute_0) {
             // input permute
             auto in0_ndims
                     = cur_op->get_input_value(0)->get_logical_tensor().ndims;
-            auto in0_perm = get_permutation(in0_ndims, "NXC", "NCX");
+            auto in0_perm = get_nxc2ncx_permutation(in0_ndims);
 
             op_ptr in0_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             in0_perm_op->set_attr<std::vector<int64_t>>(
@@ -1540,7 +1461,7 @@ status_t conv_bwd_weights_canonicalization(std::shared_ptr<subgraph_t> &sg) {
 
             auto in1_ndims
                     = cur_op->get_input_value(1)->get_logical_tensor().ndims;
-            auto in1_perm = get_permutation(in1_ndims, "NXC", "NCX");
+            auto in1_perm = get_nxc2ncx_permutation(in1_ndims);
 
             op_ptr in1_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             in1_perm_op->set_attr<std::vector<int64_t>>(
@@ -1553,10 +1474,7 @@ status_t conv_bwd_weights_canonicalization(std::shared_ptr<subgraph_t> &sg) {
         if (need_permute_1) {
             auto out_ndims
                     = cur_op->get_output_value(0)->get_logical_tensor().ndims;
-            std::string filter_format
-                    = cur_op->get_attr<std::string>(op_attr::weights_format);
-            std::vector<int64_t> out_perm
-                    = get_permutation(out_ndims, "OIX", filter_format);
+            auto out_perm = get_oix2xio_permutation(out_ndims);
 
             op_ptr out_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             out_perm_op->set_attr<std::vector<int64_t>>(
@@ -1567,7 +1485,7 @@ status_t conv_bwd_weights_canonicalization(std::shared_ptr<subgraph_t> &sg) {
                     = cur_op->get_attr<std::vector<int64_t>>(
                             op_attr::weights_shape);
             const auto filter_shape_as_oix
-                    = canonicalize(filter_shape_attr, filter_format);
+                    = canonicalize(filter_shape_attr, "XIO");
             cur_op->set_attr<dims>(op_attr::weights_shape, filter_shape_as_oix);
             cur_op->set_attr<std::string>(op_attr::weights_format, "OIX");
         }
@@ -1606,7 +1524,7 @@ status_t pool_fwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // src permute
             auto in0_ndims
                     = cur_op->get_input_value(0)->get_logical_tensor().ndims;
-            auto in0_perm = get_permutation(in0_ndims, "NXC", "NCX");
+            auto in0_perm = get_nxc2ncx_permutation(in0_ndims);
 
             op_ptr in0_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             in0_perm_op->set_attr<std::vector<int64_t>>(
@@ -1616,7 +1534,7 @@ status_t pool_fwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // dst permute
             auto out0_ndims
                     = cur_op->get_output_value(0)->get_logical_tensor().ndims;
-            auto out0_perm = get_permutation(out0_ndims, "NCX", "NXC");
+            auto out0_perm = get_ncx2nxc_permutation(out0_ndims);
 
             op_ptr out0_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             out0_perm_op->set_attr<std::vector<int64_t>>(
@@ -1646,7 +1564,7 @@ status_t pool_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // diff_dst permute
             auto in0_ndims
                     = cur_op->get_input_value(0)->get_logical_tensor().ndims;
-            auto in0_perm = get_permutation(in0_ndims, "NXC", "NCX");
+            auto in0_perm = get_nxc2ncx_permutation(in0_ndims);
 
             op_ptr in0_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             in0_perm_op->set_attr<std::vector<int64_t>>(
@@ -1658,7 +1576,7 @@ status_t pool_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
                 auto src_ndims = cur_op->get_input_value(2)
                                          ->get_logical_tensor()
                                          .ndims;
-                auto src_perm = get_permutation(src_ndims, "NXC", "NCX");
+                auto src_perm = get_nxc2ncx_permutation(src_ndims);
 
                 op_ptr src_perm_op
                         = std::make_shared<op_t>(op_kind::dnnl_permute);
@@ -1670,7 +1588,7 @@ status_t pool_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // diff_src permute
             auto out0_ndims
                     = cur_op->get_output_value(0)->get_logical_tensor().ndims;
-            auto out0_perm = get_permutation(out0_ndims, "NCX", "NXC");
+            auto out0_perm = get_ncx2nxc_permutation(out0_ndims);
 
             op_ptr out_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             out_perm_op->set_attr<std::vector<int64_t>>(
@@ -2080,7 +1998,7 @@ status_t batchnorm_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // input0 permute
             auto in0_ndims
                     = cur_op->get_input_value(0)->get_logical_tensor().ndims;
-            auto in0_perm = get_permutation(in0_ndims, "NXC", "NCX");
+            auto in0_perm = get_nxc2ncx_permutation(in0_ndims);
 
             op_ptr in_perm_op_0 = std::make_shared<op_t>(op_kind::dnnl_permute);
             in_perm_op_0->set_attr<std::vector<int64_t>>(
@@ -2090,7 +2008,7 @@ status_t batchnorm_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // input1 permute
             auto in1_ndims
                     = cur_op->get_input_value(1)->get_logical_tensor().ndims;
-            auto in1_perm = get_permutation(in1_ndims, "NXC", "NCX");
+            auto in1_perm = get_nxc2ncx_permutation(in1_ndims);
 
             op_ptr in_perm_op_1 = std::make_shared<op_t>(op_kind::dnnl_permute);
             in_perm_op_1->set_attr<std::vector<int64_t>>(
@@ -2100,7 +2018,7 @@ status_t batchnorm_bwd_canonicalization(std::shared_ptr<subgraph_t> &sg) {
             // output permute
             auto out_ndims
                     = cur_op->get_output_value(0)->get_logical_tensor().ndims;
-            auto out_perm = get_permutation(out_ndims, "NCX", "NXC");
+            auto out_perm = get_ncx2nxc_permutation(out_ndims);
 
             op_ptr out_perm_op = std::make_shared<op_t>(op_kind::dnnl_permute);
             out_perm_op->set_attr<std::vector<int64_t>>(
@@ -2522,10 +2440,6 @@ status_t fuse_adjacent_reorders(std::shared_ptr<subgraph_t> &sg) {
             out_val->set_producer(*fused_op);
 
             auto scratchpad_val = insert_empty_scratchpad(fused_op);
-            // remove pd in pd_cache since fused_op share the same id
-            if (pd_cache.find(fused_op.get()) != pd_cache.end()) {
-                pd_cache.erase(fused_op.get());
-            }
             const auto &pd = reorder_executable_t::create_desc(
                     fused_op, *p_engine, mgr, pd_cache);
             const memory::desc scratchpad_desc = pd.scratchpad_desc();
@@ -2759,7 +2673,7 @@ status_t fuse_dynamic_sub_zps_mul_scales(std::shared_ptr<subgraph_t> &sg) {
                 || visited.count(cur_op.get()) != 0)
             continue;
 
-        // This pass only handle dynamic dequantization
+        // This pass only handle dynamic quantization
         if (!cur_op->has_attr(op_attr::with_runtime_zps)
                 || !cur_op->get_attr<bool>(op_attr::with_runtime_zps))
             continue;
@@ -2825,77 +2739,6 @@ status_t fuse_dynamic_sub_zps_mul_scales(std::shared_ptr<subgraph_t> &sg) {
 
     rewriter.run();
     return status::success;
-}
-
-impl::status_t convert_dynamic_quantize_ops(std::shared_ptr<subgraph_t> &sg) {
-    std::vector<op_ptr> convert_ops;
-    std::set<op_t *> visited;
-    for (const auto &cur_op : sg->get_ops()) {
-        if ((cur_op->get_kind() != op_kind::dnnl_mul_scales
-                    && cur_op->get_kind() != op_kind::dnnl_add_zps
-                    && cur_op->get_kind() != op_kind::dnnl_sub_zps)
-                || visited.count(cur_op.get()) != 0)
-            continue;
-
-        // This pass only handle single dynamic sub_scale,add_zp,sub_zp
-        if (cur_op->get_kind() == op_kind::dnnl_mul_scales) {
-            if (!cur_op->has_attr(op_attr::with_runtime_scales)
-                    || !cur_op->get_attr<bool>(op_attr::with_runtime_scales))
-                continue;
-        } else {
-            if (!cur_op->has_attr(op_attr::with_runtime_zps)
-                    || !cur_op->get_attr<bool>(op_attr::with_runtime_zps))
-                continue;
-        }
-
-        convert_ops.emplace_back(cur_op);
-        visited.insert(cur_op.get());
-    }
-
-    if (convert_ops.empty()) return impl::status::success;
-
-    subgraph_rewriter_t rewriter(sg);
-    for (auto &cur_op : convert_ops) {
-        const int64_t axis = cur_op->get_attr<int64_t>(op_attr::axis);
-        const std::string &qtype
-                = cur_op->get_attr<std::string>(op_attr::qtype);
-
-        op_ptr fused_op = std::make_shared<op_t>(op_kind::dnnl_reorder);
-        fused_op->set_attr<bool>(op_attr::change_layout, false);
-        fused_op->set_attr<int64_t>(op_attr::axis, axis);
-        fused_op->set_attr<std::string>(op_attr::qtype, qtype);
-
-        // src must be the 0-th input
-        auto src = cur_op->get_input_value(0);
-        src->remove_consumer(*cur_op, 0);
-        fused_op->connect_input(0, src);
-
-        auto another_src = cur_op->get_input_value(1);
-        another_src->remove_consumer(*cur_op, 1);
-        fused_op->connect_input(1, another_src);
-        if (cur_op->get_kind() == op_kind::dnnl_mul_scales) {
-            // fuse scales as arg src scales
-            fused_op->set_attr<bool>(op_attr::with_runtime_scales, true);
-        } else if (cur_op->get_kind() == op_kind::dnnl_add_zps) {
-            // fuse dst zps
-            fused_op->set_attr<bool>(op_attr::with_runtime_dst_zps, true);
-        } else {
-            // fuse src zps
-            fused_op->set_attr<bool>(op_attr::with_runtime_src_zps, true);
-        }
-
-        auto dst = cur_op->get_output_value(0);
-        fused_op->add_output(dst);
-        dst->set_producer(*fused_op);
-
-        insert_empty_scratchpad(fused_op);
-
-        rewriter.to_insert(fused_op);
-        rewriter.to_remove(cur_op);
-    }
-
-    rewriter.run();
-    return impl::status::success;
 }
 
 status_t reorder_canonicalization(std::shared_ptr<subgraph_t> &sg) {
@@ -3248,27 +3091,11 @@ status_t combine_binary_post_op_scales(std::shared_ptr<subgraph_t> &sg) {
 }
 
 status_t remove_quant_data_with_no_effect(std::shared_ptr<subgraph_t> &sg) {
-    auto is_dequantize = [](const op_ptr &op) {
-        value_ptr quant_data_out_val = op->get_output_value(0);
-        value_ptr quant_data_in_val = op->get_input_value(0);
-        return op->get_kind() == op_kind::dnnl_sub_zps
-                || (op->get_kind() == op_kind::dnnl_mul_scales
-                        && quant_data_in_val->get_logical_tensor().data_type
-                                != quant_data_out_val->get_logical_tensor()
-                                           .data_type);
-    };
     std::vector<op_ptr> quant_data_ops;
     for (auto &cur_op : sg->get_ops()) {
         if (cur_op->get_kind() == op_kind::dnnl_mul_scales
                 || cur_op->get_kind() == op_kind::dnnl_add_zps
                 || cur_op->get_kind() == op_kind::dnnl_sub_zps) {
-            bool dync_quantization
-                    = cur_op->has_attr(op_attr::with_runtime_scales)
-                    && cur_op->get_attr<bool>(op_attr::with_runtime_scales);
-            if (dync_quantization) continue;
-            dync_quantization = cur_op->has_attr(op_attr::with_runtime_zps)
-                    && cur_op->get_attr<bool>(op_attr::with_runtime_zps);
-            if (dync_quantization) continue;
             quant_data_ops.emplace_back(cur_op);
         }
     }
@@ -3299,40 +3126,85 @@ status_t remove_quant_data_with_no_effect(std::shared_ptr<subgraph_t> &sg) {
             // post logical tensor should be retained
             value_ptr quant_data_out_val = quant_data_op->get_output_value(0);
             value_ptr quant_data_in_val = quant_data_op->get_input_value(0);
-            if (is_dequantize(quant_data_op)) {
-                if (!quant_data_out_val->get_consumers().empty())
-                    rewriter.fuse_op_to_successor(quant_data_op);
-                else if (quant_data_in_val->has_producer()) {
-                    quant_data_in_val->get_producer().connect_output(
-                            quant_data_in_val->get_offset(),
-                            quant_data_out_val);
-                    rewriter.to_remove(quant_data_op);
-                } else {
-                    op_ptr tc_op
-                            = std::make_shared<op_t>(op_kind::dnnl_reorder);
-                    rewriter.replace_op(quant_data_op, tc_op);
-                }
+            if (quant_data_in_val->has_producer()) {
+                quant_data_in_val->get_producer().connect_output(
+                        quant_data_in_val->get_offset(), quant_data_out_val);
+                rewriter.to_remove(quant_data_op);
             } else {
-                if (quant_data_in_val->has_producer()) {
-                    quant_data_in_val->get_producer().connect_output(
-                            quant_data_in_val->get_offset(),
-                            quant_data_out_val);
-                    rewriter.to_remove(quant_data_op);
-                } else {
-                    if (quant_data_op->get_kind() == op_kind::dnnl_mul_scales) {
-                        rewriter.fuse_op_to_successor(quant_data_op);
-                    } else {
-                        op_ptr tc_op
-                                = std::make_shared<op_t>(op_kind::dnnl_reorder);
-                        rewriter.replace_op(quant_data_op, tc_op);
-                    }
-                }
+                assertm(!quant_data_out_val->get_consumers().empty(),
+                        "single op can't be removed");
+                rewriter.fuse_op_to_successor(quant_data_op);
             }
         }
     }
 
     rewriter.run();
     return status::success;
+}
+
+status_t move_scalar_div_behind_matmul(std::shared_ptr<subgraph_t> &sg) {
+    using ltw = logical_tensor_wrapper_t;
+
+    while (true) {
+        std::vector<std::pair<op_t *, op_t *>> to_be_swapped;
+        for (auto &op : sg->get_ops()) {
+            bool ok = op->get_kind() == op_kind::dnnl_matmul
+                    && op->get_input_value(0)->has_producer();
+            if (!ok) continue;
+
+            op_t *producer = op->get_input_op(0);
+            ok = producer->get_kind() == op_kind::dnnl_binary
+                    && dnnl::algorithm::binary_div
+                            == static_cast<dnnl::algorithm>(
+                                    producer->get_attr<int64_t>(
+                                            op_attr::alg_kind));
+            if (!ok) continue;
+
+            // only match scalar div
+            auto div_src0_shape
+                    = ltw(producer->get_input_value(0)->get_logical_tensor())
+                              .vdims();
+            auto div_src1_shape
+                    = ltw(producer->get_input_value(1)->get_logical_tensor())
+                              .vdims();
+            auto div_dst_shape
+                    = ltw(producer->get_output_value(0)->get_logical_tensor())
+                              .vdims();
+            ok = div_dst_shape == div_src0_shape
+                    && std::accumulate(div_src1_shape.begin(),
+                               div_src1_shape.end(), 1,
+                               std::multiplies<int64_t>())
+                            == 1;
+            if (!ok) continue;
+
+            to_be_swapped.emplace_back(
+                    std::pair<op_t *, op_t *> {producer, op.get()});
+        }
+
+        if (to_be_swapped.empty()) break;
+
+        for (auto &pair : to_be_swapped) {
+            op_t *div = pair.first;
+            op_t *mm = pair.second;
+
+            auto div_src0 = div->get_input_value(0);
+            auto div_dst = div->get_output_value(0);
+
+            div_src0->remove_consumer(*div, 0);
+            mm->connect_input(0, div_src0);
+
+            auto mm_dst = mm->get_output_value(0);
+            div->connect_output(0, mm_dst);
+
+            logical_tensor_t new_lt = empty_logical_tensor_with_default_id();
+            auto new_val = std::make_shared<value_t>(*mm, 0, new_lt, true);
+            new_val->set_data_type(
+                    mm->get_input_value(0)->get_logical_tensor().data_type);
+            mm->connect_output(0, new_val);
+            div->connect_input(0, new_val);
+        }
+    }
+    return infer_shape(sg);
 }
 
 impl::status_t lift_up_typecast(std::shared_ptr<subgraph_t> &sg) {
@@ -3345,8 +3217,7 @@ impl::status_t lift_up_typecast(std::shared_ptr<subgraph_t> &sg) {
 
             op_t *producer = op->get_input_op(0);
             ok = producer->get_kind() == op_kind::dnnl_reshape
-                    || producer->get_kind() == op_kind::dnnl_transpose
-                    || is_layout_reorder(producer);
+                    || producer->get_kind() == op_kind::dnnl_transpose;
             if (!ok) continue;
 
             to_be_swapped.emplace_back(
@@ -3382,8 +3253,7 @@ impl::status_t lift_up_quantize(std::shared_ptr<subgraph_t> &sg) {
 
             op_t *producer = op->get_input_op(0);
             ok = producer->get_kind() == op_kind::dnnl_reshape
-                    || producer->get_kind() == op_kind::dnnl_transpose
-                    || is_layout_reorder(producer);
+                    || producer->get_kind() == op_kind::dnnl_transpose;
             if (!ok) continue;
 
             to_be_swapped.emplace_back(
@@ -3411,19 +3281,15 @@ impl::status_t fuse_dst_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg) {
                 && cur_op->get_input_value(0)->get_producer().get_kind()
                         == op_kind::dnnl_matmul
                 && !cur_op->get_output_value(0)->get_consumers().empty()
-                && (cur_op->get_output_value(0)
-                                        ->get_consumers()[0]
-                                        .get_op()
-                                        .get_kind()
-                                == op_kind::dnnl_reshape
-                        || is_layout_reorder(&cur_op->get_output_value(0)
-                                                      ->get_consumers()[0]
-                                                      .get_op()))) {
+                && cur_op->get_output_value(0)
+                                ->get_consumers()[0]
+                                .get_op()
+                                .get_kind()
+                        == op_kind::dnnl_reshape) {
             transpose_ops.emplace_back(cur_op);
         }
     }
 
-    subgraph_rewriter_t rewriter(sg);
     for (auto &transpose_op : transpose_ops) {
         value_ptr in_val = transpose_op->get_input_value(0);
         auto in_lt = in_val->get_logical_tensor();
@@ -3444,18 +3310,6 @@ impl::status_t fuse_dst_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg) {
                 [](int64_t index) { return static_cast<int32_t>(index); });
         // calculate the expected transposed layout by permuting the md
         auto expected_stride = get_dense_strides(ltw(out_lt).vdims());
-        auto &consumer = transpose_op->get_output_value(0)
-                                 ->get_consumers()[0]
-                                 .get_op();
-        if (is_layout_reorder(&consumer)) {
-            value_ptr reorder_out_val = consumer.get_output_value(0);
-            if (ltw(reorder_out_val->get_logical_tensor()).layout_type()
-                    == layout_type::strided) {
-                expected_stride
-                        = ltw(reorder_out_val->get_logical_tensor()).vstrides();
-                rewriter.fuse_op_to_predecessor(consumer.shared_from_this());
-            }
-        }
         dnnl::memory::desc out_md {ltw(out_lt).vdims(),
                 static_cast<dnnl::memory::data_type>(ltw(out_lt).data_type()),
                 expected_stride};
@@ -3467,118 +3321,6 @@ impl::status_t fuse_dst_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg) {
     }
 
     return impl::status::success;
-}
-
-impl::status_t swap_relu_mul_scales(std::shared_ptr<subgraph_t> &sg) {
-    while (true) {
-        std::vector<std::pair<graph::op_t *, graph::op_t *>> to_be_swapped;
-        for (auto &op : sg->get_ops()) {
-            bool ok = op->get_kind() == op_kind::dnnl_mul_scales
-                    && op->get_input_value(0)->has_producer();
-            if (!ok) continue;
-            graph::op_t *producer = op->get_input_op(0);
-            ok = producer->get_kind() == op_kind::dnnl_eltwise;
-            if (!ok) continue;
-            const auto alg = static_cast<dnnl::algorithm>(
-                    producer->get_attr<int64_t>(op_attr::alg_kind));
-            ok = alg == dnnl::algorithm::eltwise_relu;
-            if (!ok) continue;
-
-            // only support batchnorminference+relu+mul_scale
-            ok = producer->get_input_value(0)->has_producer();
-            if (!ok) continue;
-            const graph::op_t &prv_op
-                    = producer->get_input_value(0)->get_producer();
-            if (prv_op.get_kind() == op_kind::dnnl_batchnorm
-                    && !prv_op.get_attr<bool>(op_attr::is_training)) {
-                to_be_swapped.emplace_back(
-                        std::pair<graph::op_t *, graph::op_t *> {
-                                producer, op.get()});
-            } else {
-                continue;
-            }
-        }
-        if (to_be_swapped.empty()) break;
-        subgraph_rewriter_t rewriter(sg);
-        for (auto &pair : to_be_swapped) {
-            graph::op_t *relu = pair.first;
-            graph::op_t *mul_scales = pair.second;
-            rewriter.swap_neighboring_si_ops(
-                    relu->shared_from_this(), mul_scales->shared_from_this());
-        }
-    }
-    return infer_shape(sg);
-}
-
-impl::status_t fold_pre_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg) {
-    const auto get_next_op = [](const op_ptr &op) -> op_ptr {
-        const value_ptr out_val = op->get_output_value(0);
-        if (!out_val->get_consumers().empty()) {
-            size_t offset = out_val->get_consumers()[0].get_offset();
-            auto &next_op = out_val->get_consumers()[0].get_op();
-            return offset == 0 && next_op.get_kind() == op_kind::dnnl_batchnorm
-                    ? next_op.shared_from_this()
-                    : nullptr;
-        }
-        return nullptr;
-    };
-
-    subgraph_rewriter_t rewriter(sg);
-    for (const auto &cur_op : sg->get_ops()) {
-        if (cur_op->get_kind() != op_kind::dnnl_mul_scales) continue;
-        auto next_op = get_next_op(cur_op);
-
-        if (next_op && !next_op->get_attr<bool>(op_attr::is_training)) {
-            auto gamma_quant_op = dnnl_impl::clone_mul_scales(cur_op);
-            auto mean_quant_op = dnnl_impl::clone_mul_scales(cur_op);
-            dnnl_impl::inverse_mul_scales(mean_quant_op);
-
-            rewriter.insert_op_before(gamma_quant_op, next_op, 1, 0, 0);
-            rewriter.insert_op_before(mean_quant_op, next_op, 3, 0, 0);
-
-            auto quant_data_out_val = cur_op->get_output_value(0);
-            auto quant_data_in_val = cur_op->get_input_value(0);
-            next_op->connect_input(0, quant_data_in_val);
-            quant_data_out_val->remove_consumer(*next_op, 0);
-            if (quant_data_out_val->get_consumers().empty()) {
-                rewriter.to_remove(cur_op);
-            }
-        }
-    }
-
-    rewriter.run();
-    return infer_shape(sg);
-}
-
-impl::status_t fold_post_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg) {
-    const auto get_prev_op = [](const op_ptr &op) -> op_ptr {
-        const auto in_val = op->get_input_value(0);
-        if (in_val->has_producer()) {
-            auto &bn_op = in_val->get_producer();
-            return bn_op.get_kind() == op_kind::dnnl_batchnorm
-                    ? bn_op.shared_from_this()
-                    : nullptr;
-        }
-        return nullptr;
-    };
-
-    subgraph_rewriter_t rewriter(sg);
-    for (const auto &cur_op : sg->get_ops()) {
-        if (cur_op->get_kind() != op_kind::dnnl_mul_scales) continue;
-        auto bn_op = get_prev_op(cur_op);
-        if (bn_op && !bn_op->get_attr<bool>(op_attr::is_training)) {
-            auto gamma_quant_op = dnnl_impl::clone_mul_scales(cur_op);
-            auto beta_quant_op = dnnl_impl::clone_mul_scales(cur_op);
-            rewriter.insert_op_before(gamma_quant_op, bn_op, 1, 0, 0);
-            rewriter.insert_op_before(beta_quant_op, bn_op, 2, 0, 0);
-            value_ptr quant_data_out_val = cur_op->get_output_value(0);
-            bn_op->connect_output(0, quant_data_out_val);
-            rewriter.to_remove(cur_op);
-        }
-    }
-
-    rewriter.run();
-    return infer_shape(sg);
 }
 
 } // namespace dnnl_impl

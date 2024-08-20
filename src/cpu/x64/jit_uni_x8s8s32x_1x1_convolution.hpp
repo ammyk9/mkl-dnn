@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -77,8 +77,8 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
                             {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST,
                                     DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS,
                                     DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST})
-                    && attr()->post_ops_.check_sum_consistency(
-                            dst_md(0)->data_type, /* is_int8 */ true)
+                    && attr()->post_ops_.check_sum_consistent_dt(
+                            dst_md(0)->data_type)
                     && !has_zero_dim_memory() && attr_scales_ok()
                     && zero_points_ok()
                     && set_default_formats_common(
@@ -106,23 +106,13 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             return status::success;
         }
 
-        const memory_desc_t *dst_1x1_md(int index = 0) const {
-            return cpu_convolution_fwd_pd_t::dst_md(index);
+        const memory_desc_t *dst_md(int index = 0) const override {
+            return jcp_.with_dw_conv ? dw_conv_pd_->dst_md(index) : &dst_md_;
         }
 
-        const memory_desc_t *dst_md(
-                int index = 0, bool user_input = false) const override {
-            return jcp_.with_dw_conv
-                    ? dw_conv_pd_->dst_md(index, user_input)
-                    : cpu_convolution_fwd_pd_t::dst_md(index, user_input);
-        }
-
-        const memory_desc_t *arg_md(
-                int arg, bool user_input = false) const override {
+        const memory_desc_t *arg_md(int index = 0) const override {
             if (jcp_.with_dw_conv) {
-                switch (arg) {
-                    case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_SRC:
-                        return cpu_convolution_fwd_pd_t::dst_md(0, user_input);
+                switch (index) {
                     case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS:
                         return dw_conv_pd_->weights_md(0);
                     case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS:
@@ -130,7 +120,7 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
                     default: break;
                 }
             }
-            return convolution_fwd_pd_t::arg_md(arg, user_input);
+            return convolution_fwd_pd_t::arg_md(index);
         }
 
         arg_usage_t arg_usage(int arg) const override {
@@ -342,7 +332,7 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
                 new jit_uni_x8s8s32x_1x1_conv_kernel<isa>(
-                        pd()->jcp_, *pd()->attr(), *pd()->dst_1x1_md())));
+                        pd()->jcp_, *pd()->attr(), *pd()->dst_md())));
         CHECK(kernel_->create_kernel());
 
         if (pd()->jcp_.with_dw_conv) {

@@ -1,6 +1,13 @@
 oneAPI Deep Neural Network Library (oneDNN)
 ===========================================
 
+> **WARNING**
+>
+> This branch includes backward incompatible changes towards oneDNN v3.0 release:
+> * [Memory and primitive descriptors refactoring](https://github.com/oneapi-src/oneDNN/tree/rfcs/rfcs/20220608-make-opdesc-and-md-opaque)
+> * [Quantization scheme update](https://github.com/oneapi-src/oneDNN/tree/rfcs/rfcs/20220201-quantization-scaling)
+> * [API cleanup](https://github.com/oneapi-src/oneDNN/tree/rfcs/rfcs/20220815-v3.0-API-cleanup)
+
 <img align="left" src="https://spec.oneapi.io/oneapi-logo-white-scaled.jpg" alt="oneAPI logo">
 
 oneAPI Deep Neural Network Library (oneDNN) is an open-source cross-platform
@@ -9,7 +16,7 @@ oneDNN is part of [oneAPI](https://oneapi.io).
 The library is optimized for Intel(R) Architecture Processors, Intel Graphics,
 and Arm\* 64-bit Architecture (AArch64)-based processors. oneDNN has
 experimental support for the following architectures: NVIDIA\* GPU,
-AMD\* GPU, OpenPOWER\* Power ISA (PPC64), IBMz\* (s390x), and RISC-V.
+OpenPOWER\* Power ISA (PPC64), IBMz\* (s390x), and RISC-V.
 
 oneDNN is intended for deep learning applications and framework
 developers interested in improving application performance
@@ -89,7 +96,7 @@ integration. Compute Library is an open-source library for machine learning appl
 and provides AArch64 optimized implementations of core functions. This functionality currently
 requires that Compute Library is downloaded and built separately, see
 [Build from Source](https://oneapi-src.github.io/oneDNN/dev_guide_build.html).
-oneDNN only supports Compute Library versions 23.02.1 or later.
+oneDNN only supports Compute Library versions 22.08 or later.
 
 > **WARNING**
 >
@@ -131,14 +138,14 @@ Processors, 64-bit Arm Architecture (AArch64) processors,
 
 The CPU engine is built by default but can be disabled at build time by setting
 `DNNL_CPU_RUNTIME` to `NONE`. In this case, GPU engine must be enabled.
-The CPU engine can be configured to use the OpenMP, TBB or SYCL runtime.
+The CPU engine can be configured to use the OpenMP, TBB or DPCPP runtime.
 The following additional requirements apply:
 * OpenMP runtime requires C++ compiler with OpenMP 2.0 or later
   standard support
 * TBB runtime requires
 [Threading Building Blocks (TBB)](https://www.threadingbuildingblocks.org/)
 2017 or later.
-* SYCL runtime requires
+* DPCPP runtime requires
   * [Intel oneAPI DPC++/C++ Compiler](https://software.intel.com/en-us/oneapi/dpc-compiler)
   * [Threading Building Blocks (TBB)](https://www.threadingbuildingblocks.org/)
 
@@ -156,31 +163,21 @@ is enabled:
     * OpenCL\* runtime library (OpenCL version 1.2 or later)
     * OpenCL driver (with kernel language support for OpenCL C 2.0 or later)
       with Intel subgroups and USM extensions support
-* SYCL runtime requires
-    * [Intel oneAPI DPC++/C++ Compiler](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler.html)
+* DPCPP runtime requires
+    * [Intel oneAPI DPC++/C++ Compiler](https://software.intel.com/en-us/oneapi/dpc-compiler)
     * OpenCL runtime library (OpenCL version 1.2 or later)
     * [oneAPI Level Zero](https://github.com/oneapi-src/level-zero)
-* SYCL runtime with NVIDIA GPU support requires
-    * [oneAPI DPC++ Compiler with support for CUDA](https://github.com/intel/llvm/blob/sycl/sycl/doc/GetStartedGuide.md#build-dpc-toolchain-with-support-for-nvidia-cuda)
-      or [Intel oneAPI DPC++/C++ Compiler](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler.html) with [NVIDIA plugin](https://developer.codeplay.com/products/oneapi/nvidia/home)
+* DPCPP runtime with NVIDIA GPU support requires
+    * [oneAPI DPC++/C++ Compiler](https://github.com/intel/llvm)
     * NVIDIA CUDA\* driver
     * cuBLAS 10.1 or later
     * cuDNN 7.6 or later
-* SYCL runtime with AMD GPU support requires
-    * [oneAPI DPC++ Compiler with support for HIP AMD](https://github.com/intel/llvm/blob/sycl/sycl/doc/GetStartedGuide.md#build-dpc-toolchain-with-support-for-hip-amd)
-    * [AMD ROCm](https://github.com/RadeonOpenCompute/ROCm), version 5.3 or later
-    * [MIOpen](https://github.com/ROCmSoftwarePlatform/MIOpen), version 2.18 or later (optional if AMD ROCm includes the required version of MIOpen)
-    * [rocBLAS](https://github.com/ROCmSoftwarePlatform/rocBLAS), version 2.45.0 or later (optional if AMD ROCm includes the required version of rocBLAS)
 
 > **WARNING**
 >
-> NVIDIA GPU support is experimental. General information, build instructions,
-> and implementation limitations are available in the
+> NVIDIA GPU support is experimental. General information, build instructions
+> and implementation limitations is available in
 > [NVIDIA backend readme](https://github.com/oneapi-src/oneDNN/blob/master/src/gpu/nvidia/README.md).
->
-> AMD GPU support is experimental. General information, build instructions,
-> and implementation limitations are available in the
-> [AMD backend readme](https://github.com/oneapi-src/oneDNN/blob/master/src/gpu/amd/README.md).
 
 ### Runtime Dependencies
 
@@ -204,9 +201,9 @@ Runtime-specific dependencies:
 | `DNNL_CPU_RUNTIME=OMP`   | Intel C/C++ Compiler          | Intel OpenMP runtime (`libiomp5.so`)
 | `DNNL_CPU_RUNTIME=OMP`   | Clang                         | Intel OpenMP runtime (`libiomp5.so`)
 | `DNNL_CPU_RUNTIME=TBB`   | any                           | TBB (`libtbb.so`)
-| `DNNL_CPU_RUNTIME=SYCL` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`libsycl.so`), TBB (`libtbb.so`), OpenCL loader (`libOpenCL.so`)
+| `DNNL_CPU_RUNTIME=DPCPP` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`libsycl.so`), TBB (`libtbb.so`), OpenCL loader (`libOpenCL.so`)
 | `DNNL_GPU_RUNTIME=OCL`   | any                           | OpenCL loader (`libOpenCL.so`)
-| `DNNL_GPU_RUNTIME=SYCL` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`libsycl.so`), OpenCL loader (`libOpenCL.so`), oneAPI Level Zero loader (`libze_loader.so`)
+| `DNNL_GPU_RUNTIME=DPCPP` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`libsycl.so`), OpenCL loader (`libOpenCL.so`), oneAPI Level Zero loader (`libze_loader.so`)
 
 #### Windows
 
@@ -220,9 +217,9 @@ Runtime-specific dependencies:
 | `DNNL_CPU_RUNTIME=OMP`   | Microsoft Visual C++ Compiler | No additional requirements
 | `DNNL_CPU_RUNTIME=OMP`   | Intel C/C++ Compiler          | Intel OpenMP runtime (`iomp5.dll`)
 | `DNNL_CPU_RUNTIME=TBB`   | any                           | TBB (`tbb.dll`)
-| `DNNL_CPU_RUNTIME=SYCL` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`sycl.dll`), TBB (`tbb.dll`), OpenCL loader (`OpenCL.dll`)
+| `DNNL_CPU_RUNTIME=DPCPP` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`sycl.dll`), TBB (`tbb.dll`), OpenCL loader (`OpenCL.dll`)
 | `DNNL_GPU_RUNTIME=OCL`   | any                           | OpenCL loader (`OpenCL.dll`)
-| `DNNL_GPU_RUNTIME=SYCL` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`sycl.dll`), OpenCL loader (`OpenCL.dll`), oneAPI Level Zero loader (`ze_loader.dll`)
+| `DNNL_GPU_RUNTIME=DPCPP` | Intel oneAPI DPC++ Compiler   | Intel oneAPI DPC++ Compiler runtime (`sycl.dll`), OpenCL loader (`OpenCL.dll`), oneAPI Level Zero loader (`ze_loader.dll`)
 
 #### macOS
 
@@ -331,7 +328,6 @@ terms.
 
 Apache License Version 2.0:
 * [Xbyak_aarch64](https://github.com/fujitsu/xbyak_aarch64)
-* [LLVM](https://llvm.org)
 
 Boost Software License, Version 1.0:
 * [Boost C++ Libraries](https://www.boost.org/)

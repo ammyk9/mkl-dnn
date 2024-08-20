@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,7 +51,6 @@ struct ref_convolution_fwd_t : public gpu_primitive_t {
                     | primitive_attr_t::skip_mask_t::post_ops
                     | primitive_attr_t::skip_mask_t::sum_dt;
 
-            const bool is_int8 = utils::one_of(src_md_.data_type, s8, u8);
             bool ok = set_default_alg_kind(alg_kind::convolution_direct)
                     && utils::one_of(desc()->prop_kind,
                             prop_kind::forward_training,
@@ -72,14 +71,14 @@ struct ref_convolution_fwd_t : public gpu_primitive_t {
                     && this->set_default_formats()
                     && attr()->has_default_values(
                             attr_skip_mask, dst_md_.data_type)
-                    && attr()->post_ops_.check_sum_consistency(
-                            dst_md_.data_type, is_int8, true)
+                    && attr()->post_ops_.check_sum_consistent_dt(
+                            dst_md_.data_type, true)
                     && attr_.set_default_formats(dst_md(0)) == status::success
                     && post_ops_with_binary_ok(
                             attr(), dst_md()->data_type, 5, 0xffff)
                     && attr_scales_ok() && zero_points_ok(attr())
-                    && IMPLICATION(
-                            !attr()->scales_.has_default_values(), is_int8);
+                    && IMPLICATION(!attr()->scales_.has_default_values(),
+                            utils::one_of(src_md_.data_type, s8, u8));
             if (!ok) return status::unimplemented;
 
             return init_conf(engine);
@@ -107,8 +106,7 @@ struct ref_convolution_fwd_t : public gpu_primitive_t {
         auto status = pd()->init_kernel_ctx(kernel_ctx);
         if (status != status::success) return status;
 
-        CHECK(create_kernel(
-                engine, &kernel_, "ref_convolution_fwd", kernel_ctx));
+        create_kernel(engine, &kernel_, "ref_convolution_fwd", kernel_ctx);
         if (!kernel_) return status::runtime_error;
 
         return status::success;
@@ -181,8 +179,7 @@ struct ref_convolution_bwd_data_t : public gpu_primitive_t {
         auto status = pd()->init_kernel_ctx(kernel_ctx);
         if (status != status::success) return status;
 
-        CHECK(create_kernel(
-                engine, &kernel_, "ref_convolution_bwd_data", kernel_ctx));
+        create_kernel(engine, &kernel_, "ref_convolution_bwd_data", kernel_ctx);
         if (!kernel_) return status::runtime_error;
 
         return status::success;
@@ -255,8 +252,8 @@ struct ref_convolution_bwd_weights_t : public gpu_primitive_t {
         auto status = pd()->init_kernel_ctx(kernel_ctx);
         if (status != status::success) return status;
 
-        CHECK(create_kernel(
-                engine, &kernel_, "ref_convolution_bwd_weights", kernel_ctx));
+        create_kernel(
+                engine, &kernel_, "ref_convolution_bwd_weights", kernel_ctx);
         if (!kernel_) return status::runtime_error;
 
         return status::success;

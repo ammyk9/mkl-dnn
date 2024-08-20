@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@
 
 #include "cpu/x64/jit_avx512_core_bf16cvt.hpp"
 #include "cpu/x64/jit_generator.hpp"
-#include "cpu/x64/utils/jit_io_helper.hpp"
 
 // #define TR_DEBUG
 #if defined(TR_DEBUG)
@@ -124,12 +123,12 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
         int tail_len_unroll = 0;
         int len_unroll = 1;
 
-        // It is responsible for finding as many values as kernel can unroll.
-        // If tail is present, then kernel will unroll only last node.
-        // If there is no tail, kernel can unroll few nodes without any loops.
-        // `ndims_full_unroll` - how many nodes will be unrolled
-        // `len_last_dim_unroll` - which piece of the last unrolled node will
-        // be unrolled.
+        // It is responsible for finding as many values
+        // as kernel can unroll. If tail is present then
+        // kernel will unroll only last node (possible improvement).
+        // If there is no tail kernel can unroll a few nodes without any loops etc.
+        // ndims_full_unroll - how many nodes will be unrolled
+        // len_last_dim_unroll - what piece of last unrolled node will be unrolled
         if (prb.is_tail_present) {
             ndims_full_unroll = 1;
             len_unroll = prb.nodes[0].n;
@@ -260,7 +259,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
         using namespace data_type;
 
         const auto cvt2ps
-                = [this](const Ymm dst, const Operand &src, data_type_t idt) {
+                = [=](const Ymm dst, const Operand &src, data_type_t idt) {
                       switch (idt) {
                           case f32:
                               if (src.isMEM() || src.getIdx() != dst.getIdx())
@@ -297,7 +296,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
                       }
                   };
 
-        const auto cvt2odt = [this, cvt2ps](const Ymm ymm, data_type_t odt,
+        const auto cvt2odt = [=](const Ymm ymm, data_type_t odt,
                                      data_type_t idt) {
             const Xmm xmm = Xmm(ymm.getIdx());
             switch (odt) {
@@ -362,7 +361,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             }
         };
 
-        auto load = [this](const Ymm ymm, const Address &addr, int size) {
+        auto load = [=](const Ymm ymm, const Address &addr, int size) {
             const Xmm xmm = Xmm(ymm.getIdx());
             switch (size) {
                 case 32: vmovups(ymm, addr); break;
@@ -372,7 +371,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             }
         };
 
-        auto store = [this](const Address &addr, const Ymm ymm, int size) {
+        auto store = [=](const Address &addr, const Ymm ymm, int size) {
             const Xmm xmm = Xmm(ymm.getIdx());
             switch (size) {
                 case 32: vmovups(addr, ymm); break;
@@ -471,80 +470,95 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
         return true;
     }
 
-    template <typename Vmm>
-    bool process_direct_copy(const int ndims, const int len_unroll) {
+    template <cpu_isa_t isa>
+    bool process_direct_copy(const int ndims, const int len) {
         using namespace data_type;
 
-        static constexpr bool is_zmm = std::is_same<Vmm, Xbyak::Zmm>::value;
-        static constexpr bool is_ymm = std::is_same<Vmm, Xbyak::Ymm>::value;
-        static constexpr int vlen = vreg_traits<Vmm>::vlen;
-        const int simd_w = vlen / sizeof(float);
-        const int len_tail = len_unroll % simd_w;
-        const bool is_i8 = utils::one_of(s8, prb_.itype, prb_.otype)
-                || utils::one_of(u8, prb_.itype, prb_.otype);
-        const bool is_s32 = utils::everyone_is(s32, prb_.itype, prb_.otype);
-
         static constexpr int desirable_stride = 1;
-        const bool can_do = prb_.ndims == 1
-                // XXX: io_helper has an implicit conversion to f32 which is
-                //  incorrect for s32->s32. Disabling it for now.
-                && !is_s32
+        using Vmm = typename cpu_isa_traits<isa>::Vmm;
+        const int simd_w = cpu_isa_traits<isa>::vlen / itype_sz_;
+
+        // TODO: support tail_processing for direct copy
+
+        const bool do_src_zp = prb_.req_src_zp;
+        const bool do_dst_zp = prb_.req_dst_zp;
+        const bool zp_applicable = IMPLICATION(
+                (do_src_zp || do_dst_zp), utils::one_of(prb_.itype, s32, f32));
+        const bool can_do = true && mayiuse(isa)
+                && compensation_needed_ == false
                 && utils::everyone_is(desirable_stride, prb_.os(0), prb_.is(0))
-                // s8u8 with AVX should be used with XMM vreg.
-                && IMPLICATION(is_i8 && isa_ == avx, !is_ymm)
-                && !prb_.is_tail_present && !compensation_needed_
+                && (false || (prb_.itype == prb_.otype ? zp_applicable : false)
+                        || (prb_.itype == s32 && prb_.otype == f32)
+                        || (prb_.itype == f32 && prb_.otype == s32))
+                && len % simd_w == 0 && prb_.n(0) % len == 0
+                && !prb_.is_tail_present
                 && prb_.src_scale_type == scale_type_t::NONE
-                && prb_.dst_scale_type == scale_type_t::NONE && !prb_.req_src_zp
-                && !prb_.req_dst_zp && prb_.beta == 0.f;
+                && prb_.dst_scale_type == scale_type_t::NONE
+                && prb_.beta == 0.f;
         if (!can_do) return false;
 
-        const int tail_opmask_idx = 2;
-        const int tail_vmm_idx = 0;
-        // Unroll might be max of 16 for zmm or 8 otherwise so keep auxiliary
-        // registers indices higher than this number. Follow existing bf16_emu
-        // register numeration for that.
-        const int zero_idx
-                = is_zmm ? bf16_emu_zmm_4_idx_ + 1 : xmm_zero_.getIdx();
-        const int saturation_ubound_idx
-                = is_zmm ? zero_idx + 1 : xmm_saturation_ubound_.getIdx();
-        const int max_unroll = is_zmm ? 16 : 8;
-        assert(zero_idx >= max_unroll);
-        assert(saturation_ubound_idx >= max_unroll);
+        static constexpr int vmm_zp_last_idx = 15;
+        const auto vmm_src_zp
+                = Vmm(do_dst_zp ? vmm_zp_last_idx - 1 : vmm_zp_last_idx);
+        if (do_src_zp) {
+            uni_vpbroadcastd(vmm_src_zp, PARAM(src_zp));
+            uni_vcvtdq2ps(vmm_src_zp, vmm_src_zp);
+        }
+        const auto vmm_dst_zp = Vmm(vmm_zp_last_idx);
+        if (do_dst_zp) {
+            uni_vpbroadcastd(vmm_dst_zp, PARAM(dst_zp));
+            uni_vcvtdq2ps(vmm_dst_zp, vmm_dst_zp);
+        }
 
-        io::io_conf_t io_conf;
-        io::io_tail_conf_t io_tail_conf(
-                simd_w, len_tail, tail_opmask_idx, tail_vmm_idx, reg_tmp_);
-        io::io_emu_bf16_conf_t io_bf16_conf(bf16_emu_zmm_1_idx_,
-                bf16_emu_zmm_2_idx_, bf16_emu_zmm_3_idx_, reg_tmp_,
-                bf16_emu_zmm_4_idx_);
-        io::io_saturation_conf_t io_saturation_conf(
-                zero_idx, saturation_ubound_idx, reg_tmp_);
-        io::jit_io_multi_dt_helper_t<Vmm> io(this, isa_,
-                {prb_.itype, prb_.otype}, io_conf, io_tail_conf, io_bf16_conf,
-                {{prb_.otype, io_saturation_conf}});
+        const auto apply_zp_ps = [&](const Vmm vmm) {
+            if (do_src_zp) uni_vsubps(vmm, vmm, vmm_src_zp);
+            if (do_dst_zp) uni_vaddps(vmm, vmm, vmm_dst_zp);
+        };
 
-        io.init_saturate_f32({prb_.otype});
-
-        int off = 0;
-        for (; off + len_tail < len_unroll;) {
-            int n_vregs_to_process_len_unroll = (len_unroll - off) / simd_w;
-            int unroll = nstl::min(max_unroll, n_vregs_to_process_len_unroll);
+        for (int off = 0; off < len;) {
+            // TODO: we need extra reg for proper saturation if otype == s32
+            int unroll
+                    = nstl::min(16 - (prb_.otype == s32), (len - off) / simd_w);
+            unroll = (do_src_zp || do_dst_zp)
+                    ? nstl::min(unroll, 16 - do_src_zp - do_dst_zp)
+                    : unroll;
 
             for (int ur = 0; ur < unroll; ++ur) {
                 const auto vmm = Vmm(ur);
-                io[prb_.itype]->load(i_addr(off + ur * simd_w), vmm, false);
-                io[prb_.otype]->store(vmm, o_addr(off + ur * simd_w), false);
+                uni_vmovups(vmm, i_addr(off + ur * simd_w));
+            }
+
+            if (prb_.itype != prb_.otype) {
+                for (int ur = 0; ur < unroll; ++ur) {
+                    const auto vmm = Vmm(ur);
+                    if (prb_.itype == s32 && prb_.otype == f32) {
+                        uni_vcvtdq2ps(vmm, vmm);
+                        apply_zp_ps(vmm);
+                    } else if (prb_.itype == f32 && prb_.otype == s32) {
+                        apply_zp_ps(vmm);
+                        uni_vcvtps2dq(vmm, vmm);
+                    } else
+                        assert(!"unreachable");
+                }
+            } else if (do_src_zp || do_dst_zp) {
+                for (int ur = 0; ur < unroll; ++ur) {
+                    const auto vmm = Vmm(ur);
+                    if (prb_.otype == f32) {
+                        apply_zp_ps(vmm);
+                    } else if (prb_.otype == s32) {
+                        uni_vcvtdq2ps(vmm, vmm);
+                        apply_zp_ps(vmm);
+                        uni_vcvtps2dq(vmm, vmm);
+                    }
+                }
+            }
+
+            for (int ur = 0; ur < unroll; ++ur) {
+                const auto vmm = Vmm(ur);
+                uni_vmovups(o_addr(off + ur * simd_w), vmm);
             }
 
             off += unroll * simd_w;
-            assert(off <= len_unroll);
-        }
-
-        if (len_tail) {
-            io.prepare_tail_mask();
-            const auto vmm = Vmm(tail_vmm_idx + 1);
-            io[prb_.itype]->load(i_addr(off), vmm, true);
-            io[prb_.otype]->store(vmm, o_addr(off), true);
         }
 
         return true;
@@ -556,7 +570,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
         using namespace data_type;
 
         const auto cvt2ps
-                = [this](const Xmm dst, const Operand &src, data_type_t idt) {
+                = [=](const Xmm dst, const Operand &src, data_type_t idt) {
                       Xmm dst_pure = Xmm(dst.getIdx());
                       switch (idt) {
                           case f32:
@@ -584,7 +598,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
                       }
                   };
 
-        const auto cvt2odt = [this, cvt2ps](const Xmm xmm, data_type_t odt,
+        const auto cvt2odt = [=](const Xmm xmm, data_type_t odt,
                                      data_type_t idt) {
             switch (odt) {
                 case bf16:
@@ -649,7 +663,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             }
         };
 
-        auto load = [this](const Xmm xmm, const Address &addr, int size) {
+        auto load = [=](const Xmm xmm, const Address &addr, int size) {
             switch (size) {
                 case 16: uni_vmovups(xmm, addr); break;
                 case 8: uni_vmovsd(xmm, addr); break;
@@ -660,17 +674,17 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             }
         };
 
-        auto load_bytes = [this](const Xmm xmm, const Address &addr, int size,
-                                  int imm) {
-            switch (size) {
-                case 4: uni_vpinsrd(xmm, xmm, addr, imm); break;
-                case 2: uni_vpinsrw(xmm, xmm, addr, imm); break;
-                case 1: uni_vpinsrb(xmm, xmm, addr, imm); break;
-                default: assert(!"unreachable");
-            }
-        };
+        auto load_bytes
+                = [=](const Xmm xmm, const Address &addr, int size, int imm) {
+                      switch (size) {
+                          case 4: uni_vpinsrd(xmm, xmm, addr, imm); break;
+                          case 2: uni_vpinsrw(xmm, xmm, addr, imm); break;
+                          case 1: uni_vpinsrb(xmm, xmm, addr, imm); break;
+                          default: assert(!"unreachable");
+                      }
+                  };
 
-        auto store = [this](const Address &addr, const Xmm xmm, int size) {
+        auto store = [=](const Address &addr, const Xmm xmm, int size) {
             switch (size) {
                 case 16: uni_vmovups(addr, xmm); break;
                 case 8: uni_vmovsd(addr, xmm); break;
@@ -1156,14 +1170,9 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
     void compute_ker(
             const int ndims, const int len_unroll, const bool tail_processing) {
         bool optimized = false;
-        if (is_superset(isa_, avx512_core)) {
-            optimized = process_direct_copy<Zmm>(ndims, len_unroll);
-        } else if (is_superset(isa_, avx)) {
-            optimized = process_direct_copy<Ymm>(ndims, len_unroll);
-        } else {
-            optimized = process_direct_copy<Xmm>(ndims, len_unroll);
-        }
-        if (!optimized) optimized = process_unroll_tr8x8(ndims, len_unroll);
+        optimized = optimized || process_direct_copy<avx>(ndims, len_unroll)
+                || process_direct_copy<sse41>(ndims, len_unroll)
+                || process_unroll_tr8x8(ndims, len_unroll);
         if (!optimized)
             process_unroll_generic(ndims, len_unroll, tail_processing);
     }
@@ -1553,17 +1562,13 @@ private:
     const Xmm xmm_saturation_ubound_ = xmm12;
     const Ymm ymm_saturation_ubound_ = ymm12;
 
-    const int bf16_emu_zmm_1_idx_ = 16;
-    const int bf16_emu_zmm_2_idx_ = 17;
-    const int bf16_emu_zmm_3_idx_ = 18;
-    const int bf16_emu_zmm_4_idx_ = 19;
     /* bf16 support on SKX */
     std::unique_ptr<bf16_emulation_t> bf16_emu_;
-    const Zmm bf16_emu_reserv_1_ = Zmm(bf16_emu_zmm_1_idx_);
-    const Zmm bf16_emu_reserv_2_ = Zmm(bf16_emu_zmm_2_idx_);
+    const Zmm bf16_emu_reserv_1_ = Zmm(16);
+    const Zmm bf16_emu_reserv_2_ = Zmm(17);
     const Reg64 bf16_emu_scratch_ = reg_tmp_;
-    const Zmm bf16_emu_reserv_3_ = Zmm(bf16_emu_zmm_3_idx_);
-    const Zmm bf16_emu_reserv_4_ = Zmm(bf16_emu_zmm_4_idx_);
+    const Zmm bf16_emu_reserv_3_ = Zmm(18);
+    const Zmm bf16_emu_reserv_4_ = Zmm(19);
 };
 
 // Seperate class for no unroll/threading burden
@@ -1960,12 +1965,9 @@ static void prb_block_for_cache(tr::prb_t &prb) {
             // asymmetric_comp is executed.
             && IMPLICATION(prb.req_asymmetric_comp, !prb.is_tail_present);
 
-    const bool is_direct_copy
-            = prb.ndims == 1 && prb.nodes[0].is == 1 && prb.nodes[0].os == 1;
-
     const bool cache_blocking_needed
             = stride_cache_friendly || requires_inner_blocking;
-    if (!cache_blocking_needed || is_direct_copy) return;
+    if (!cache_blocking_needed) return;
 
     int unit_input_stride_idx = -1;
     for (auto idx = 0; idx < prb.ndims; ++idx) {
@@ -2045,17 +2047,11 @@ static void prb_thread_kernel_balance(
     for (int d = 0; d < prb.ndims; ++d)
         size_total *= prb.nodes[d].n;
 
-    // The general expression for size_drv_thr can be written as
-    // size_drv_min = C0 + FC * (nthr > 1 ? 1 : 0) + VC * (nthr - 1)
-    // where FC and VC are fixed and variable costs respectively.
-    // Though for now, the below heuristic seems to be good enough
-    // Note: direct copy needs only as many kernels as nthr.
-    const bool is_direct_copy
-            = prb.ndims == 1 && prb.nodes[0].is == 1 && prb.nodes[0].os == 1;
-
-    const size_t size_drv_thr = is_direct_copy ? nthr
-            : (nthr > 1)                       ? 16 * nthr
-                                               : 1;
+    /* The general expression for size_drv_thr can be written as
+     * size_drv_min = C0 + FC * (nthr > 1 ? 1 : 0) + VC * (nthr - 1)
+     * where FC and VC are fixed and variable costs respectively.
+     * Though for now, the below heuristic seems to be good enough */
+    const size_t size_drv_thr = (nthr > 1) ? 16 * nthr : 1;
 
     /* size_drv_min is the minimal size for the parallel
      * driver required for good parallelization */
@@ -2225,7 +2221,7 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         return status::unimplemented;
     }
     _pd->ker_desc_ = ker_desc;
-    CHECK(_pd->init_scratchpad_md());
+    _pd->init_scratchpad_md();
 
     return safe_ptr_assign(*reorder_pd, _pd);
 }
@@ -2421,11 +2417,11 @@ void jit_uni_reorder_t::omp_driver(const char *in, char *out,
     out += pd()->prb_.ooff * data_type_size(pd()->prb_.otype);
 
     DEBUG({
-        printf("prb  : ");
+        printf("prb : ");
         tr::prb_dump(pd()->prb_);
     });
     DEBUG({
-        printf("ker  : ");
+        printf("ker : ");
         tr::prb_dump(pd()->ker_desc_.prb);
     });
 
@@ -2635,7 +2631,7 @@ status_t jit_blk_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         delete _pd;
         return status::unimplemented;
     }
-    CHECK(_pd->init_scratchpad_md());
+    _pd->init_scratchpad_md();
 
     return safe_ptr_assign(*reorder_pd, _pd);
 }

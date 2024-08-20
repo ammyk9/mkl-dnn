@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,10 +15,8 @@
 *******************************************************************************/
 
 #include "common/c_types_map.hpp"
-#include "common/compiler_workarounds.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/nstl.hpp"
-#include "common/primitive_desc_iterator.hpp"
 #include "common/type_helpers.hpp"
 #include "common/utils.hpp"
 
@@ -106,32 +104,13 @@ status_t bwd_conv_desc_create(const deconvolution_desc_t *fwd_deconv_d,
     CHECK(weights_axes_permutation(
             &conv_weights_d, deconv_weights_d, with_groups));
 
-    CHECK(conv_desc_init(bwd_conv_d, prop_kind::backward_data,
+    return conv_desc_init(bwd_conv_d, prop_kind::backward_data,
             alg_kind::convolution_direct, src_md, &conv_weights_d,
             &fwd_deconv_d->bias_desc, dst_md, fwd_deconv_d->strides,
             fwd_deconv_d->dilates, fwd_deconv_d->padding[0],
-            fwd_deconv_d->padding[1]));
-
-    // HACK: Set src_desc and dst_desc as a signal to the primitive
-    //       descriptor cache that we are using the deconv version of bwd conv
-    //       and thus need a separate cache entry (this will also disallow calling
-    //       bwd_d conv with postops). This assumes that external users only use
-    //       the API to create conv descs, and relies on common/convolution.cpp
-    //       only setting the expected mem descs.
-    // TODO: Pass this information via attributes or integrate this method
-    //       directly into bwd conv implementations.
-    bwd_conv_d->src_desc = bwd_conv_d->diff_src_desc;
-    bwd_conv_d->dst_desc = bwd_conv_d->diff_dst_desc;
-    return status::success;
+            fwd_deconv_d->padding[1]);
 }
 } // namespace
-
-template <typename implementation_pd>
-status_t check_embedded_impl_init(primitive_desc_iterator_t &it) {
-    const auto pd = dynamic_cast<implementation_pd *>((*it).get());
-    if (pd != nullptr) return status::success; // implementation found
-    return status::unimplemented;
-}
 
 template <cpu_isa_t isa>
 status_t brgemm_deconvolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
@@ -140,25 +119,20 @@ status_t brgemm_deconvolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     using namespace format_tag;
     using smask_t = primitive_attr_t::skip_mask_t;
     const deconvolution_desc_t *fwd_deconv_d = desc();
-    const auto src_type = fwd_deconv_d->src_desc.data_type;
-    const auto dst_type = fwd_deconv_d->dst_desc.data_type;
-    const bool is_int8 = utils::one_of(src_type, s8, u8);
-
-    auto skip_mask = smask_t::post_ops | smask_t::sum_dt;
-    if (is_int8)
-        skip_mask |= smask_t::scales_runtime | smask_t::zero_points_runtime;
 
     const bool ok = is_fwd()
             && (desc()->alg_kind & alg_kind::deconvolution_direct)
-            && attr()->has_default_values(skip_mask, dst_type)
-            && attr()->post_ops_.check_sum_consistency(dst_type, is_int8)
+            && IMPLICATION(fwd_deconv_d->src_desc.data_type == f16,
+                    isa == avx512_core_amx_fp16)
+            && attr()->has_default_values(smask_t::scales_runtime
+                    | smask_t::post_ops | smask_t::zero_points_runtime)
             && attr_scales_ok() && post_ops_ok() && zero_points_ok()
             && !has_zero_dim_memory();
     if (!ok) return status::unimplemented;
 
     convolution_desc_t conv_d = convolution_desc_t();
 
-    assert(src_type != data_type::undef);
+    assert(fwd_deconv_d->src_desc.data_type != data_type::undef);
 
     const int ndims_spatial = fwd_deconv_d->dst_desc.ndims - 2;
     for (int i = 0; i < ndims_spatial; i++) {
@@ -168,46 +142,39 @@ status_t brgemm_deconvolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
         }
     }
 
+    primitive_desc_t *pd;
+
     if (has_strides_) {
         CHECK(bwd_conv_desc_create(fwd_deconv_d, &conv_d));
-        primitive_desc_iterator_t it(engine,
-                reinterpret_cast<const op_desc_t *>(&conv_d), attr(), nullptr);
-        if (!it.is_initialized()) return status::out_of_memory;
-
-        while (++it != it.end()) {
-            conv_pd_ = *it;
-            // flag used to enable post-ops and properly disable zero-points
-            constexpr bool is_deconv = true;
-            if (check_embedded_impl_init<
-                        typename brgemm_convolution_bwd_strided_t<isa,
-                                is_deconv>::pd_t>(it)
-                    == status::success)
-                break;
-        }
-        if (it == it.end()) return status::unimplemented;
+        // try creating bwd conv prim desc
+        constexpr bool enable_postops
+                = true; // postops are enabled only for deconv (used only in strided version)
+        using bwd_conv_str_pd_t = typename brgemm_convolution_bwd_strided_t<isa,
+                enable_postops>::pd_t;
+        CHECK(primitive_desc_t::create<bwd_conv_str_pd_t>(&pd,
+                reinterpret_cast<const op_desc_t *>(&conv_d), attr(), engine,
+                nullptr));
     } else {
         CHECK(fwd_conv_desc_create(fwd_deconv_d, &conv_d));
-
-        primitive_desc_iterator_t it(engine,
-                reinterpret_cast<const op_desc_t *>(&conv_d), attr(), nullptr);
-        if (!it.is_initialized()) return status::out_of_memory;
-
-        while (++it != it.end()) {
-            conv_pd_ = *it;
-            // try 1x1 fwd convolution
-            if (check_embedded_impl_init<
-                        typename brgemm_1x1_convolution_fwd_t<isa>::pd_t>(it)
-                    == status::success)
-                break;
-            // try non-1x1 fwd convolution with invert weights' spatial indices
-            constexpr bool use_inversion = true;
-            if (check_embedded_impl_init<typename brgemm_convolution_fwd_t<isa,
-                            use_inversion>::pd_t>(it)
-                    == status::success)
-                break;
-        }
-        if (it == it.end()) return status::unimplemented;
+        do {
+            // try creating fwd 1x1 conv prim desc
+            using fwd_1x1_conv_pd_t =
+                    typename brgemm_1x1_convolution_fwd_t<isa>::pd_t;
+            status_t s = primitive_desc_t::create<fwd_1x1_conv_pd_t>(&pd,
+                    reinterpret_cast<const op_desc_t *>(&conv_d), attr(),
+                    engine, nullptr);
+            if (s == status::success) break;
+            // try creating fwd conv prim desc
+            constexpr bool use_inversion
+                    = true; // invert weights' spatial indices
+            using fwd_conv_pd_t =
+                    typename brgemm_convolution_fwd_t<isa, use_inversion>::pd_t;
+            CHECK(primitive_desc_t::create<fwd_conv_pd_t>(&pd,
+                    reinterpret_cast<const op_desc_t *>(&conv_d), attr(),
+                    engine, nullptr));
+        } while (false);
     }
+    conv_pd_.reset(pd);
 
     if (weights_md_.format_kind == format_kind::any) {
         if (has_strides_)
@@ -232,7 +199,6 @@ status_t brgemm_deconvolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     if (bias_md_.format_kind == format_kind::any)
         CHECK(memory_desc_init_by_tag(bias_md_, x));
 
-    init_name();
     auto scratchpad = scratchpad_registry().registrar();
     scratchpad.book(memory_tracking::names::key_nested,
             conv_pd_->scratchpad_registry());
@@ -263,13 +229,6 @@ status_t brgemm_deconvolution_fwd_t<isa>::execute(const exec_ctx_t &ctx) const {
     return conv_p_->execute(conv_ctx);
 }
 
-template struct brgemm_deconvolution_fwd_t<avx2>;
-template struct brgemm_deconvolution_fwd_t<avx2_vnni>;
-template struct brgemm_deconvolution_fwd_t<avx2_vnni_2>;
-template struct brgemm_deconvolution_fwd_t<avx512_core>;
-template struct brgemm_deconvolution_fwd_t<avx512_core_vnni>;
-template struct brgemm_deconvolution_fwd_t<avx512_core_bf16>;
-template struct brgemm_deconvolution_fwd_t<avx512_core_fp16>;
 template struct brgemm_deconvolution_fwd_t<avx512_core_amx>;
 template struct brgemm_deconvolution_fwd_t<avx512_core_amx_fp16>;
 

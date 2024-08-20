@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -60,8 +60,8 @@ struct jit_uni_x8s8s32x_convolution_fwd_t : public primitive_t {
                                     | smask_t::zero_points_runtime
                                     | smask_t::post_ops | smask_t::sum_dt,
                             dst_md(0)->data_type)
-                    && attr()->post_ops_.check_sum_consistency(
-                            dst_md(0)->data_type, /* is_int8 */ true)
+                    && attr()->post_ops_.check_sum_consistent_dt(
+                            dst_md(0)->data_type)
                     && !has_zero_dim_memory() && attr_scales_ok()
                     && zero_points_ok();
             if (!args_ok) return status::unimplemented;

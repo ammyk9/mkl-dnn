@@ -35,12 +35,6 @@ namespace jit {
 ;
 #undef _CATALOG_
 
-status_t gen_gemm_kernel_desc_t::create_generator(
-        engine_t *engine, compute::compiled_kernel_t &generator) const {
-    gen_gemm_kernel_t kd(*this);
-    return compute::compiled_kernel_t::create(generator, engine, kd);
-}
-
 status_t gen_gemm_kernel_desc_t::finalize() {
     // Update problem alignments to match catalog entry.
     if (!isPacked(problem_.A.layout)) {
@@ -65,19 +59,7 @@ status_t gen_gemm_kernel_desc_t::finalize() {
     strategy_.unroll[LoopM] = entry_->driverInfo.unroll[LoopM];
     strategy_.unroll[LoopN] = entry_->driverInfo.unroll[LoopN];
     parseStrategy(entry_->strategy, hw_, problem_, strategy_);
-    if (isPacked(problem_.A.layout) || isPacked(problem_.B.layout))
-        strategy_.panelCheck |= (hw_ >= ngen::HW::XeHPC);
     adjustStrategy(hw_, problem_, strategy_);
-
-    // Disable global k parallelization if it wouldn't be used.
-    if (strategy_.kParallel && k_ >= 0) {
-        auto k_min = aux_params_.k0;
-        if (strategy_.kParallelLocal) k_min *= strategy_.wg[LoopK];
-        if (k_ <= k_min) {
-            strategy_.kParallel = false;
-            strategy_.C.atomic = false;
-        }
-    }
 
     // Always use variable beta for global k-parallel kernels.
     if (strategy_.kParallel) problem_.beta_real = Scalar<double>();
@@ -97,16 +79,12 @@ status_t gen_gemm_kernel_desc_t::finalize() {
             dim_t thread_gpu = eu_count_
                     * compute::device_info_t::threads_per_eu(
                             arch_, strategy_.GRFs > 128);
-            if (thread_count <= thread_gpu) {
-                strategy_.persistent = false;
-                strategy_.cWalkOrder = WalkOrder::HW2D;
-                strategy_.blocking[LoopM] = 16777216;
-                strategy_.blocking[LoopN] = 16777216;
-            }
+            if (thread_count <= thread_gpu)
+                strategy_.persistent = strategy_.hilbertOrder
+                        = strategy_.boustrophedon = false;
         }
     }
 
-    strategy_.systolicAvailable &= !disable_systolic_;
     strategy_.preflight(hw_, problem_);
 
     update_driver_info();
@@ -123,7 +101,6 @@ void gen_gemm_kernel_desc_t::update_driver_info() {
 
     switch (hw_) {
         REG_GEN9_ISA(ARCH_DISPATCH(Gen9))
-        REG_GEN11_ISA(ARCH_DISPATCH(Gen11))
         REG_XELP_ISA(ARCH_DISPATCH(XeLP))
         REG_XEHP_ISA(ARCH_DISPATCH(XeHP))
         REG_XEHPG_ISA(ARCH_DISPATCH(XeHPG))
@@ -199,14 +176,13 @@ status_t gen_gemm_kernel_desc_t::transfer_post_ops(
 }
 
 status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
-        int stepping, int eu_count, bool has_systolic, compute_mode mode,
-        int batch_dims, bool trans_a, bool trans_b, bool trans_co, bool swap_ab,
-        bool a_offset, bool b_offset, bool c_offset, bool bias,
-        sum_ab_t reduce_ab, float alpha, float beta, const post_ops_t &post_ops,
-        data_type_t a_type, data_type_t b_type, data_type_t c_type,
-        data_type_t co_type, data_type_t acc_type, int align_a, int align_b,
-        int align_c, dim_t m, dim_t n, dim_t k, dim_t lda, dim_t ldb, dim_t ldc,
-        dim_t batch) {
+        int stepping, int eu_count, compute_mode mode, int batch_dims,
+        bool trans_a, bool trans_b, bool trans_co, bool swap_ab, bool a_offset,
+        bool b_offset, bool c_offset, bool bias, sum_ab_t reduce_ab,
+        float alpha, float beta, const post_ops_t &post_ops, data_type_t a_type,
+        data_type_t b_type, data_type_t c_type, data_type_t co_type,
+        data_type_t acc_type, int align_a, int align_b, int align_c, dim_t m,
+        dim_t n, dim_t k, dim_t lda, dim_t ldb, dim_t ldc, dim_t batch) {
     using namespace ngen;
     using namespace kcatalog;
 
@@ -217,7 +193,8 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     n_ = n;
     k_ = k;
     eu_count_ = eu_count;
-    disable_systolic_ = !has_systolic;
+    a_offset_ = a_offset;
+    b_offset_ = b_offset;
 
     align_a = nstl::max(align_a, int(types::data_type_size(a_type)));
     align_b = nstl::max(align_b, int(types::data_type_size(b_type)));
@@ -243,8 +220,6 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
         problem_.batchDims = batch_dims;
     }
     if (a_offset || b_offset) problem_.abOffset = ABOffset::Calc;
-    if (a_offset) problem_.aoPtrDims = 0;
-    if (b_offset) problem_.boPtrDims = 0;
 
     if (problem_.Ta.isInteger()) problem_.Ts = Type::f32;
 
@@ -284,7 +259,6 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     if (lda * problem_.Ta >= 64) *tags++ = kcatalog::ReqBlock2DA;
     if (ldb * problem_.Tb >= 64) *tags++ = kcatalog::ReqBlock2DB;
     if (ldc * problem_.Tc >= 64) *tags++ = kcatalog::ReqBlock2DC;
-    if (has_systolic) *tags++ = kcatalog::ReqSystolic;
 
     if ((mode & mode_tf32)
             && utils::everyone_is(Type::f32, problem_.Ta, problem_.Tb)) {
@@ -305,10 +279,7 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     EvaluateParams eval_params;
 
     eval_params.sizes = match_params[0].sizes;
-    eval_params.alpha = alpha;
-    eval_params.beta = beta;
-    eval_params.postOps = (post_ops.len() > 0);
-    eval_params.cConvert = (acc_type != c_type);
+    eval_params.beta = (post_ops.len() > 0) ? 0.0f : beta;
     eval_params.euCount = eu_count;
 
     entry_ = select(
@@ -336,22 +307,23 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
 }
 
 status_t gen_gemm_xe_systolic_kernel_desc_t::select_kernel(
-        compute::gpu_arch_t arch, int stepping, int eu_count, int batch_dims,
-        bool packed_c, bool trans_co, bool a_offset, bool b_offset,
-        bool c_offset, bool bias, float alpha, float beta,
-        const post_ops_t &post_ops, data_type_t a_type, data_type_t b_type,
-        data_type_t c_type, data_type_t co_type, data_type_t acc_type, dim_t m,
-        dim_t n, dim_t k, dim_t batch, int unroll_m, int unroll_n, bool alt) {
+        compute::gpu_arch_t arch, int eu_count, int batch_dims, bool packed_c,
+        bool trans_co, bool a_offset, bool b_offset, bool c_offset, bool bias,
+        float alpha, float beta, const post_ops_t &post_ops, data_type_t a_type,
+        data_type_t b_type, data_type_t c_type, data_type_t co_type,
+        data_type_t acc_type, dim_t m, dim_t n, dim_t k, dim_t batch,
+        int unroll_m, int unroll_n, bool alt) {
     using namespace ngen;
     using namespace kcatalog;
 
     arch_ = arch;
     hw_ = convert_dnnl_arch_to_hw(arch);
-    stepping_ = stepping;
     m_ = m;
     n_ = n;
     k_ = k;
     eu_count_ = eu_count;
+    a_offset_ = a_offset;
+    b_offset_ = b_offset;
 
     if (!utils::one_of(hw_, HW::XeHP, HW::XeHPG, HW::XeHPC))
         return status::unimplemented;
@@ -390,8 +362,6 @@ status_t gen_gemm_xe_systolic_kernel_desc_t::select_kernel(
         problem_.batchDims = batch_dims;
     }
     if (a_offset || b_offset) problem_.abOffset = ABOffset::Load;
-    if (a_offset) problem_.aoPtrDims = 0;
-    if (b_offset) problem_.boPtrDims = 0;
     if (alpha == 1.0f) problem_.alpha_real = alpha;
     if (beta == 0.0f || beta == 1.0f) problem_.beta_real = beta;
 
@@ -421,12 +391,8 @@ status_t gen_gemm_xe_systolic_kernel_desc_t::select_kernel(
     match_params.unroll[LoopM] = unroll_m;
     match_params.unroll[LoopN] = unroll_n;
 
-    auto tags = const_cast<char *>(match_params.tags);
-    while (*tags)
-        tags++;
-
-    *tags++ = kcatalog::ReqSystolic;
-    if (alt) *tags++ = kcatalog::ReqCustom1;
+    const char alt_tag[2] = {kcatalog::ReqCustom1, '\0'};
+    if (alt) match_params.lateTags = match_params.tags = &alt_tag[0];
 
     EvaluateParams eval_params;
 
@@ -503,13 +469,13 @@ void gen_gemm_kernel_t::init_interface() {
     interface_.newArgument("alpha_real", s_type_ngen);
     interface_.newArgument("beta_real", s_type_ngen);
     if (problem.abOffset != ABOffset::None) {
-        if (problem.aoPtrDims < 0 && problem.boPtrDims < 0)
+        if (!desc()->a_offset_ && !desc()->b_offset_)
             interface_.newArgument("abo", DataType::ud);
         else {
-            if (problem.aoPtrDims >= 0)
+            if (desc()->a_offset_)
                 interface_.newArgument(
                         "ao_ptr", ExternalArgumentType::GlobalPtr);
-            if (problem.boPtrDims >= 0)
+            if (desc()->b_offset_)
                 interface_.newArgument(
                         "bo_ptr", ExternalArgumentType::GlobalPtr);
         }
@@ -559,13 +525,11 @@ void gen_gemm_kernel_t::init_interface() {
         interface_.newArgument("group_count_m", DataType::ud);
         interface_.newArgument("group_count_n", DataType::ud);
     }
-    if (strategy.cWalkOrder == WalkOrder::SimpleLinear)
-        interface_.newArgument("group_count_recip", DataType::ud);
-    else if (strategy.cWalkOrder == WalkOrder::Hilbertlike) {
+    if (strategy.hilbertOrder) {
         interface_.newArgument("hilbert_vd", DataType::ud);
         interface_.newArgument("hilbert_uvd_recip", DataType::ud);
         interface_.newArgument("hilbert_bail", DataType::ud);
-    } else if (strategy.cWalkOrder == WalkOrder::Boustrophedon) {
+    } else if (strategy.boustrophedon) {
         interface_.newArgument("bslice", DataType::d);
         interface_.newArgument("bthresh", DataType::d);
     }
@@ -577,8 +541,10 @@ void gen_gemm_kernel_t::init_interface() {
     interface_.externalName(kernel_name());
 }
 
-gpu::compute::binary_t gen_gemm_kernel_t::get_binary(
+cl_kernel gen_gemm_kernel_t::get_kernel(
         cl_context context, cl_device_id device) {
+    cl_kernel ocl_kernel = nullptr;
+
     init_interface();
 
 #define ARCH_DISPATCH(arch) \
@@ -586,13 +552,12 @@ gpu::compute::binary_t gen_gemm_kernel_t::get_binary(
         gemm_kernel_generator_t<ngen::HW::arch> generator; \
         generator.setStepping(desc()->stepping_); \
         generator.gemm(*desc()->problem(), *desc()->strategy(), interface_); \
-        return generator.getBinary(context, device); \
+        ocl_kernel = generator.getKernel(context, device); \
         break; \
     }
 
     switch (desc()->hw_) {
         REG_GEN9_ISA(ARCH_DISPATCH(Gen9))
-        REG_GEN11_ISA(ARCH_DISPATCH(Gen11))
         REG_XELP_ISA(ARCH_DISPATCH(XeLP))
         REG_XEHP_ISA(ARCH_DISPATCH(XeHP))
         REG_XEHPG_ISA(ARCH_DISPATCH(XeHPG))
@@ -600,7 +565,7 @@ gpu::compute::binary_t gen_gemm_kernel_t::get_binary(
         default: assert(!"Unsupported architecture"); break;
     }
 
-    return {};
+    return ocl_kernel;
 
 #undef ARCH_DISPATCH
 }

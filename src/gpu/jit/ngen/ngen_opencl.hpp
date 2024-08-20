@@ -29,10 +29,6 @@
 
 #include "npack/neo_packager.hpp"
 
-#ifndef CL_DEVICE_IP_VERSION_INTEL
-#define CL_DEVICE_IP_VERSION_INTEL 0x4250
-#endif
-
 namespace ngen {
 
 
@@ -53,15 +49,11 @@ template <HW hw>
 class OpenCLCodeGenerator : public ELFCodeGenerator<hw>
 {
 public:
-    explicit OpenCLCodeGenerator(Product product_)  : ELFCodeGenerator<hw>(product_) {}
     explicit OpenCLCodeGenerator(int stepping_ = 0) : ELFCodeGenerator<hw>(stepping_) {}
 
     inline std::vector<uint8_t> getBinary(cl_context context, cl_device_id device, const std::string &options = "-cl-std=CL2.0");
     inline cl_kernel getKernel(cl_context context, cl_device_id device, const std::string &options = "-cl-std=CL2.0");
     static inline HW detectHW(cl_context context, cl_device_id device);
-    static inline void detectHWInfo(cl_context context, cl_device_id device, HW &outHW, Product &outProduct);
-
-    /* Deprecated. Use the Product-based API instead. */
     static inline void detectHWInfo(cl_context context, cl_device_id device, HW &outHW, int &outStepping);
 
 private:
@@ -89,8 +81,8 @@ static inline std::vector<uint8_t> getOpenCLCProgramBinary(cl_context context, c
         throw opencl_error();
 
     detail::handleCL(clBuildProgram(program, 1, &device, options, nullptr, nullptr));
-    cl_uint nDevices = 0;
-    detail::handleCL(clGetProgramInfo(program, CL_PROGRAM_NUM_DEVICES, sizeof(cl_uint), &nDevices, nullptr));
+    size_t nDevices = 0;
+    detail::handleCL(clGetProgramInfo(program, CL_PROGRAM_NUM_DEVICES, sizeof(size_t), &nDevices, nullptr));
     std::vector<cl_device_id> devices(nDevices);
     detail::handleCL(clGetProgramInfo(program, CL_PROGRAM_DEVICES, sizeof(cl_device_id) * nDevices, devices.data(), nullptr));
     size_t deviceIdx = std::distance(devices.begin(), std::find(devices.begin(), devices.end(), device));
@@ -228,9 +220,9 @@ template <HW hw>
 HW OpenCLCodeGenerator<hw>::detectHW(cl_context context, cl_device_id device)
 {
     HW outHW;
-    Product outProduct;
+    int outStepping;
 
-    detectHWInfo(context, device, outHW, outProduct);
+    detectHWInfo(context, device, outHW, outStepping);
 
     return outHW;
 }
@@ -238,30 +230,12 @@ HW OpenCLCodeGenerator<hw>::detectHW(cl_context context, cl_device_id device)
 template <HW hw>
 void OpenCLCodeGenerator<hw>::detectHWInfo(cl_context context, cl_device_id device, HW &outHW, int &outStepping)
 {
-    Product outProduct;
-    detectHWInfo(context, device, outHW, outProduct);
-    outStepping = outProduct.stepping;
-}
-
-template <HW hw>
-void OpenCLCodeGenerator<hw>::detectHWInfo(cl_context context, cl_device_id device, HW &outHW, Product &outProduct)
-{
     const char *dummyCL = "kernel void _ngen_hw_detect(){}";
     const char *dummyOptions = "";
 
-    // Try CL_DEVICE_IP_VERSION_INTEL query first.
-    cl_uint ipVersion = 0;      /* should be cl_version, but older CL/cl.h may not define cl_version */
-    if (clGetDeviceInfo(device, CL_DEVICE_IP_VERSION_INTEL, sizeof(ipVersion), &ipVersion, nullptr) == CL_SUCCESS) {
-        outProduct = npack::decodeHWIPVersion(ipVersion);
-        outHW = getCore(outProduct.family);
-        if (outProduct.family != ProductFamily::Unknown)
-            return;
-    }
-
-    // If it fails, compile a test program and extract the HW information from it.
     auto binary = detail::getOpenCLCProgramBinary(context, device, dummyCL, dummyOptions);
 
-    ELFCodeGenerator<hw>::getBinaryHWInfo(binary, outHW, outProduct);
+    ELFCodeGenerator<hw>::getBinaryHWInfo(binary, outHW, outStepping);
 }
 
 } /* namespace ngen */

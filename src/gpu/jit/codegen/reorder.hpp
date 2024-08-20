@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,14 +17,11 @@
 #ifndef GPU_JIT_CODEGEN_REORDER_HPP
 #define GPU_JIT_CODEGEN_REORDER_HPP
 
-#include "common/utils.hpp"
 #include "gpu/jit/codegen/operand.hpp"
 #include "gpu/jit/codegen/register_scope.hpp"
 #include "gpu/jit/ir/reorder.hpp"
 #include "gpu/jit/ir/tensor.hpp"
 #include "gpu/jit/ngen/ngen.hpp"
-#include "gpu/jit/utils/iterator.hpp"
-#include "gpu/jit/utils/range.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -61,8 +58,8 @@ public:
 
         for (int i = 0; i < original_esize; i += esize) {
             fixup(op, mod, dst, src);
-            shift_offset(dst, esize * dst.getHS());
-            shift_offset(src, esize * src.getHS());
+            shift_offset(dst, esize);
+            shift_offset(src, esize);
         }
     }
 
@@ -192,8 +189,6 @@ bool try_emit_batched_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
         host->emov(mod, dst, src);
     };
 
-    // Do not attempt to match offsets when not moving data between pipes
-    const auto dst_off = (to_ir(dst_type).is_fp()) ? dst.byte_offset() : 0;
     for (int i = 0; i < width; i += batch) {
         int i_beg = i;
         int i_end = std::min(width, i + batch);
@@ -203,10 +198,8 @@ bool try_emit_batched_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             esize = utils::rnd_down_pow2(esize);
 
             auto s = src.subregister(ii, esize, src_type_size);
-            auto t = tmp.subregister(dst_off + (ii - i_beg) * 4, small_type)(4);
+            auto t = tmp.subregister((ii - i_beg) * 4, small_type)(4);
             ngen::InstructionModifier mod = esize;
-            if (src_type == ngen::DataType::f && hw == ngen::HW::Gen9)
-                host->rnde(esize, s(1), s(1));
             if (dst_type == small_type) mod |= host->sat;
             plan(mov, mod, t, s(1));
             ii += esize;
@@ -216,7 +209,7 @@ bool try_emit_batched_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             esize = utils::rnd_down_pow2(esize);
 
             auto d = dst.subregister(ii, esize, dst_type_size);
-            auto t = tmp.subregister(dst_off + (ii - i_beg) * 4, small_type)(4);
+            auto t = tmp.subregister((ii - i_beg) * 4, small_type)(4);
             plan(mov, esize, d(1), t);
             ii += esize;
         }
@@ -391,19 +384,12 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             auto t1 = tmp1.subregister(t1_offset, dst_type);
             auto t2 = tmp2.subregister(t2_offset, dst_type);
 
-            if (esize == 1) {
-                plan(mov, 2 | host->sat, t1(tmp_stride), s);
-                plan(mov, 1, d, t1);
-                continue;
-            }
-
-            // Operands are already dword aligned as required by F-pipe
-            if (dst_stride_bytes >= tmp_stride_bytes) {
+            if (dst_stride_bytes >= tmp_stride_bytes && esize > 1) {
                 plan(mov, esize | host->sat, d(dst_stride), s(src_stride));
                 continue;
             }
-
-            plan(mov, esize | host->sat, t1(tmp_stride), s(src_stride));
+            auto wa_esize = std::max(2, esize);
+            plan(mov, wa_esize | host->sat, t1(tmp_stride), s(src_stride));
             if (t1_offset != t2_offset)
                 plan(mov, esize, t2(tmp_stride), t1(tmp_stride));
             else
@@ -458,7 +444,9 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             auto d = dst.subregister(i, esize, dst_stride_bytes);
             auto t = tmp.subregister(s.getByteOffset(), tmp_type);
             plan(mov, esize, t(tmp_stride), s(src_stride));
-            plan(mov, esize, d.d()(dst_stride), t.d()(tmp_stride));
+            // df -> f uses the float pipe. Override ngen setting the long pipe.
+            auto mod_with_pipe = esize | ngen::SWSB<float>(1);
+            plan(mov, mod_with_pipe, d.d()(dst_stride), t.d()(tmp_stride));
         }
         return;
     }
@@ -540,11 +528,13 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
     // - s8/u8 must be DW-strided: use temporary
     bool d_or_f_to_b = (src_d || src_f) && dst_b;
     bool b_to_d_or_f = (dst_d || dst_f) && src_b;
-    if (d_or_f_to_b || b_to_d_or_f) {
+    bool hf_to_b = src_hf && dst_b;
+    if (d_or_f_to_b || b_to_d_or_f || hf_to_b) {
         if (dst_d || dst_f) ir_assert(dst_stride_bytes == 4);
         if (src_d || src_f) ir_assert(src_stride_bytes == 4);
-        if (dst_b) ir_assert(utils::one_of(dst_stride_bytes, 1, 4, 8));
-        if (src_b) ir_assert(utils::one_of(src_stride_bytes, 1, 4, 8));
+        if (src_hf) ir_assert(utils::one_of(src_stride_bytes, 2, 4));
+        if (dst_b) ir_assert(utils::one_of(dst_stride_bytes, 1, 4));
+        if (src_b) ir_assert(utils::one_of(src_stride_bytes, 1, 4));
         int step = get_step();
         const int step_size = step * (int)sizeof(uint32_t);
         const int nregs = 1 + utils::div_up(step_size, grf_size);
@@ -557,20 +547,13 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
 
             auto s = src.subregister(i, esize, src_stride_bytes);
             auto d = dst.subregister(i, esize, dst_stride_bytes);
-            if (src_d || src_f) {
+            if (src_d || src_f || src_hf) {
                 // d -> b.
-                if (src_f && hw == ngen::HW::Gen9)
-                    host->rnde(esize, s(src_stride), s(src_stride));
-                if (esize == 1) {
-                    // relaxed F-pipe alignment requirements for f32 broadcast
-                    auto t = tmp1.subregister(0, dst_type);
-                    plan(mov, 2 | host->sat, t(4), s);
-                    plan(mov, 1, d, t);
-                } else if (dst_stride_bytes == 1) {
+                if (dst_stride_bytes == 1 || esize == 1) {
                     auto offset_bytes = src_f ? s.getByteOffset()
                                               : 4 * (d.getByteOffset() % 16);
                     auto t = tmp1.subregister(offset_bytes, dst_type)(4);
-                    plan(mov, esize | host->sat, t, s(src_stride));
+                    plan(mov, std::max(2, esize) | host->sat, t, s(src_stride));
                     if (offset_bytes != 4 * (d.getByteOffset() % 16)) {
                         auto t2 = tmp2.subregister(
                                 4 * (d.getByteOffset() % 16), dst_type)(4);
@@ -606,10 +589,8 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             && dst_stride == 1 && width > 1) {
         int step = get_step();
         auto step_size = step * src_type_size * src_stride;
-        auto tmp_regs = utils::div_up(step_size, grf_size);
-        auto tmp = lex_scope.alloc_reg_buf_data(tmp_regs);
-        auto tmp2_regs = utils::div_up(step * dst_type_size, grf_size);
-        auto tmp2 = lex_scope.alloc_reg_buf_data(tmp2_regs);
+        auto nregs = utils::div_up(step_size, grf_size);
+        auto tmp = lex_scope.alloc_reg_buf_data(nregs);
         for (int i = 0; i < width; i += step) {
             step = std::min(step, width - i);
             step = utils::rnd_down_pow2(step);
@@ -621,7 +602,9 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             auto d_old = d;
             bool d_half_grf_aligned
                     = utils::one_of(d.byte_offset(), 0, grf_size / 2);
-            if (!d_half_grf_aligned) { d = tmp2.format(0, dst_type, esize); }
+            if (!d_half_grf_aligned) {
+                d = scope.alloc_reg_data(to_ir(dst_type).with_elems(esize));
+            }
             if (s.offset() != 0) {
                 auto t = tmp.format(0, src_type, esize, src_stride);
                 plan(mov, esize, t, s);
@@ -639,8 +622,6 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
     // less limitations.
     if (src_xf || dst_xf) {
         int step = get_step();
-        auto tmp_regs = utils::div_up(step * dst_type_size, grf_size);
-        auto tmp = lex_scope.alloc_reg_buf_data(tmp_regs);
         for (int i = 0; i < width; i += step) {
             step = std::min(step, width - i);
             step = utils::rnd_down_pow2(step);
@@ -652,7 +633,6 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                     esize, dst_stride);
             auto d_old = d;
 
-            if (src_f && hw == ngen::HW::Gen9) host->rnde(esize, s, s);
             bool do_d0_align = false;
             if (esize > 1 && dst_bf) {
                 bool d_0_aligned = (d.byte_offset() == 0);
@@ -661,7 +641,9 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                     do_d0_align = true;
                 }
             }
-            if (do_d0_align) { d = tmp.format(0, dst_type, esize); }
+            if (do_d0_align) {
+                d = lex_scope.alloc_reg_data(to_ir(dst_type).with_elems(esize));
+            }
 
             bool do_align = false;
             if (esize > 1 && s.hs() != 0) {
@@ -859,10 +841,11 @@ void align_src_dst_offset(GeneratorT *host, ngen_register_scope_t &scope,
 // allocated. For example: A -> T -> B or A -> B -> T -> B
 class reorder_2d_impl_t {
 public:
-    reorder_2d_impl_t(ngen::HW hw, tensor_t tile, const layout_t &src_layout,
-            const layout_t &dst_layout)
-        : hw_(hw), src_(src_layout), dst_(dst_layout), tile_(std::move(tile)) {
+    reorder_2d_impl_t(
+            ngen::HW hw, const layout_t &src_layout, const layout_t &dst_layout)
+        : hw_(hw), src_(src_layout), dst_(dst_layout) {
         ir_assert(src_.type() == dst_.type());
+        tile_ = find_2d_tile(src_, dst_);
     }
 
     const tensor_t &tile() const { return tile_; }
@@ -928,6 +911,62 @@ public:
             prev_layout = next_layout;
             prev_rd = next_rd;
         }
+    }
+
+    // Returns the biggest common 2D tile that is innermost for both layouts.
+    // The returned tile contains at most max_elems elements. If match_outer is
+    // true, then outer parts of both layouts are required to be equal.
+    // Returns an empty tensor if the requested tile is not found.
+    static tensor_t find_2d_tile(const layout_t &a, const layout_t &b,
+            int max_elems = std::numeric_limits<int>::max(),
+            bool match_outer = false) {
+        std::vector<dim_t> tile_dims(a.ndims(), 1);
+        if (a.blocks().empty() || b.blocks().empty())
+            return tensor_t(tile_dims);
+
+        auto non_one_ndims = [](const tensor_t &t) {
+            int ret = 0;
+            for (dim_t d : t.dims())
+                ret += (d != 1 ? 1 : 0);
+            return ret;
+        };
+
+        layout_iterator_t a_it(a);
+        layout_iterator_t b_it(b);
+
+        tensor_t max_tile;
+        for (;;) {
+            auto a_tile = a_it.tile();
+            auto b_tile = b_it.tile();
+            if (non_one_ndims(a_tile) > 2 || non_one_ndims(b_tile) > 2) break;
+            if (!a.map(a_tile).is_dense() || !b.map(b_tile).is_dense()) break;
+            dim_t a_elems = a_tile.elems();
+            dim_t b_elems = b_tile.elems();
+
+            bool tile_ok = true;
+            if (!a_tile.is_equal(b_tile)) tile_ok = false;
+            if (match_outer) {
+                auto a_outer = a_it.outer_layout();
+                auto b_outer = b_it.outer_layout();
+                if (!a_outer.is_equal(b_outer)) tile_ok = false;
+            }
+            if (tile_ok) {
+                if (a_it.nblocks() > max_tile_blocks) break;
+                if (b_it.nblocks() > max_tile_blocks) break;
+                if (a_tile.elems() > max_elems) break;
+                max_tile = a_tile;
+                if (!a_it.has_next() || !b_it.has_next()) break;
+                ++a_it;
+                ++b_it;
+            } else if (a_elems <= b_elems) {
+                if (!a_it.has_next()) break;
+                ++a_it;
+            } else {
+                if (!b_it.has_next()) break;
+                ++b_it;
+            }
+        }
+        return max_tile;
     }
 
     static const int max_tile_blocks = 4;
@@ -1300,6 +1339,175 @@ private:
     tensor_t tile_;
 };
 
+class dense_2d_block_filter_t {
+public:
+    bool operator()(const block_t &b) {
+        if (b.block == 1) return false;
+        if ((dim_t)b.stride != stride_) return false;
+        stride_ *= b.block;
+        if (!have_seen(b.dim_idx)) non_one_ndims_++;
+        return non_one_ndims_ <= 2;
+    }
+
+    dense_2d_block_filter_t() = default;
+
+private:
+    bool have_seen(int idx) {
+        auto ret = seen_.insert(idx);
+        return !ret.second;
+    }
+
+    dim_t stride_ = 1;
+    int non_one_ndims_ = 0;
+    std::unordered_set<int> seen_;
+};
+
+template <typename IterT>
+class filter_t {
+    using inner_iter_t = decltype(std::declval<const IterT>().begin());
+    using iter_value_t = decltype(*std::declval<inner_iter_t>());
+    using predicate_t = std::function<bool(const iter_value_t &)>;
+
+public:
+    class iterator_t {
+    public:
+        bool operator==(const iterator_t &it) const { return it_ == it.it_; }
+        bool operator!=(const iterator_t &it) const { return !operator==(it); }
+        const iter_value_t &operator*() const { return *it_; }
+        iterator_t &operator++() {
+            if (it_ == end_) return *this;
+            while (++it_ != end_ && !predicate_(*it_))
+                ;
+            return *this;
+        }
+
+        iterator_t(inner_iter_t it, inner_iter_t end, predicate_t predicate)
+            : it_(it), end_(end), predicate_(predicate) {
+            if (it_ != end_ && !predicate_(*it_)) operator++();
+        }
+
+    private:
+        inner_iter_t it_, end_;
+        std::function<bool(const iter_value_t &)> predicate_;
+    };
+
+    iterator_t begin() const { return {begin_, end_, predicate_}; }
+    iterator_t end() const { return {end_, end_, predicate_}; }
+
+    filter_t(const IterT &it, predicate_t predicate)
+        : begin_(it.begin()), end_(it.end()), predicate_(predicate) {}
+
+private:
+    inner_iter_t begin_, end_;
+    predicate_t predicate_;
+};
+
+class shared_inner_tiles_t {
+    using blocks_t = std::vector<block_t>;
+    using block_iterator_t = filter_t<blocks_t>::iterator_t;
+
+    class inner_tile_iterator_t {
+    public:
+        bool operator==(const inner_tile_iterator_t &it) const {
+            return curr_ == it.curr_;
+        }
+        bool operator!=(const inner_tile_iterator_t &it) const {
+            return !operator==(it);
+        }
+
+        inner_tile_iterator_t &operator++() {
+            if (curr_ == end_) return *this;
+
+            auto size = (*curr_).block;
+            while (++factor_ <= size) {
+                if (size % factor_ == 0) return *this;
+            }
+
+            dims_[(*curr_).dim_idx] *= size;
+            ++curr_;
+            factor_ = 1;
+            return operator++();
+        }
+
+        tensor_t operator*() const {
+            auto dims = dims_;
+            dims[(*curr_).dim_idx] *= factor_;
+            return tensor_t(dims);
+        }
+
+        inner_tile_iterator_t(block_iterator_t curr, block_iterator_t end,
+                const tensor_t &tile)
+            : curr_(std::move(curr))
+            , end_(std::move(end))
+            , dims_(tile.dims())
+            , factor_(1) {}
+
+    private:
+        block_iterator_t curr_, end_;
+        std::vector<dim_t> dims_;
+        dim_t factor_;
+    };
+
+    class iterator_t {
+    public:
+        bool operator==(const iterator_t &it) const {
+            return a_it_ == it.a_it_ && b_it_ == it.b_it_;
+        }
+        bool operator!=(const iterator_t &it) const { return !operator==(it); }
+
+        iterator_t &operator++() {
+            bool adv_a = true, adv_b = true;
+            while (adv_a || adv_b) {
+                adv_a = (a_it_ != a_end_)
+                        && (b_it_ == b_end_
+                                || (*a_it_).elems() <= (*b_it_).elems());
+                adv_b = (b_it_ != b_end_)
+                        && (a_it_ == a_end_
+                                || (*b_it_).elems() <= (*a_it_).elems());
+                if (adv_a) ++a_it_;
+                if (adv_b) ++b_it_;
+                if (a_it_ != a_end_) a_tile_ = *a_it_;
+                if (b_it_ != b_end_) b_tile_ = *b_it_;
+                if (a_tile_.is_equal(b_tile_)) break;
+            }
+            return *this;
+        }
+
+        const tensor_t &operator*() const { return a_tile_; }
+
+        iterator_t(const block_iterator_t &a_it, const block_iterator_t &a_end,
+                const block_iterator_t &b_it, const block_iterator_t &b_end,
+                const tensor_t &tile)
+            : a_it_(a_it, a_end, tile)
+            , a_end_(a_end, a_end, tile)
+            , b_it_(b_it, b_end, tile)
+            , b_end_(b_end, b_end, tile) {}
+
+    private:
+        inner_tile_iterator_t a_it_, a_end_;
+        inner_tile_iterator_t b_it_, b_end_;
+        tensor_t a_tile_, b_tile_;
+    };
+
+public:
+    iterator_t begin() const {
+        return {a_.begin(), a_.end(), b_.begin(), b_.end(), default_tile_};
+    }
+    iterator_t end() const {
+        return {a_.end(), a_.end(), b_.end(), b_.end(), default_tile_};
+    }
+
+    shared_inner_tiles_t(const layout_t &a, const layout_t &b)
+        : a_(a.blocks(), dense_2d_block_filter_t())
+        , b_(b.blocks(), dense_2d_block_filter_t())
+        , default_tile_(std::vector<dim_t>(a.ndims(), 1)) {}
+
+private:
+    filter_t<blocks_t> a_;
+    filter_t<blocks_t> b_;
+    tensor_t default_tile_;
+};
+
 class reorder_impl_t {
 public:
     reorder_impl_t(ngen::HW hw, const reorder_t &reorder)
@@ -1347,105 +1555,99 @@ private:
         });
     }
 
-    static std::vector<tensor_t> find_2d_dense_tiles(
-            const layout_t &a, const layout_t &b) {
-        using tile_pair_t = std::array<tensor_t, 2>;
-        static constexpr int max_tile_blocks
-                = reorder_2d_impl_t::max_tile_blocks;
-        auto dense_2d_blocks = []() {
-            dim_t stride = 1;
-            int non_one_dims = 0;
-            int count = 0;
-            std::unordered_set<int> seen;
-            return [=](const block_t &b) mutable {
-                if ((dim_t)b.stride != stride) return false;
-                if (b.block != 1) {
-                    count++;
-                    stride *= b.block;
-                    auto ret = seen.insert(b.dim_idx);
-                    if (ret.second) non_one_dims++;
-                }
-                return non_one_dims <= 2 && count <= max_tile_blocks;
-            };
-        };
-
-        auto take_smaller = [](const tensor_t &a, const tensor_t &b) {
-            return a.elems() <= b.elems();
-        };
-
-        auto equal_tiles
-                = [](const tile_pair_t &p) { return p[0].is_equal(p[1]); };
-
-        auto to_single_tile = [](const tile_pair_t &p) { return p[0]; };
-
-        auto all_dims_pow2 = [](const tensor_t &tile) {
+    static tensor_t find_max_2d_dense_tile(const layout_t &a_layout,
+            const layout_t &b_layout, dim_t max_elems) {
+        shared_inner_tiles_t tiles {a_layout, b_layout};
+        tensor_t max_tile;
+        auto all_pow2 = [](const tensor_t &tile) {
             for (auto d : tile.dims())
                 if (!math::is_pow2(d)) return false;
             return true;
         };
 
-        auto a_tiles = inner_tiles(
-                a.blocks() | filter(dense_2d_blocks()), a.ndims());
-        auto b_tiles = inner_tiles(
-                b.blocks() | filter(dense_2d_blocks()), b.ndims());
-        auto tiles = merge(a_tiles, b_tiles, take_smaller) | filter(equal_tiles)
-                | transform(to_single_tile) | filter(all_dims_pow2);
-        std::vector<tensor_t> ret;
-        for (const auto &tile : tiles)
-            ret.insert(ret.begin(), tile);
-        return ret;
+        for (auto &tile : tiles) {
+            if (tile.elems() > max_elems) break;
+            if (all_pow2(tile)) max_tile = tile;
+        }
+        // No point in tiling with a 1x1 tile
+        return max_tile.elems() > 1 ? max_tile : tensor_t();
     }
 
     template <typename GeneratorT>
     bool try_emit_2d(GeneratorT *host, ngen_register_scope_t &scope,
             const reg_buf_data_t &src_rd, const reg_buf_data_t &dst_rd) {
-        const int grf_size = ngen::GRF::bytes(hw_);
-
         if (src_layout_.type() != dst_layout_.type()) return false;
-        // long / f64 swizzle emits scalar instructions
-        if (src_layout_.type().scalar().size() >= 8) return false;
         if (!src_layout_.is_dense()) return false;
         if (!dst_layout_.is_dense()) return false;
 
-        const auto type = to_ngen(src_layout_.type());
-        for (const auto &tile : find_2d_dense_tiles(src_layout_, dst_layout_)) {
-            if (tile.ndims() < 2) continue;
-            if (tile.elems() < 4) break;
-            auto src_tile_layout = src_layout_.map(tile);
-            auto dst_tile_layout = dst_layout_.map(tile);
-            if (!dst_tile_layout.is_dense()) continue;
+        int max_tile_size = 512;
+        int max_tile_elems = max_tile_size / src_layout_.type().size();
+        auto tile = find_max_2d_dense_tile(
+                src_layout_, dst_layout_, max_tile_elems);
 
-            // Set layout offset to 0 since the offset is handled by fixing up
-            // the register input to try_emit_2d_impl
-            src_tile_layout.set_offset(0);
-            dst_tile_layout.set_offset(0);
+        // Couldn't find tile, 2D reorder is not supported.
+        if (tile.is_empty()) return false;
 
-            // Try to allocate/release a temporary buffer to avoid
-            // out_of_registers exception.
-            auto dummy = scope.try_alloc_range(
-                    utils::div_up(dst_tile_layout.size(), grf_size));
-            if (dummy.isInvalid()) continue;
-
-            // Allocation succeeded, can proceed further.
-            scope.safeRelease(dummy);
-
-            reorder_2d_impl_t r(hw_, tile, src_tile_layout, dst_tile_layout);
-            src_layout_.for_each_tile(
-                    tile, [&](const std::vector<dim_t> &start) {
-                        auto src_off
-                                = src_layout_.offset_in_bytes<dim_t>(start);
-                        auto dst_off
-                                = dst_layout_.offset_in_bytes<dim_t>(start);
-                        auto src_tile_rd = src_rd.format(int(src_off), type);
-                        auto dst_tile_rd = dst_rd.format(int(dst_off), type);
-
-                        ngen_register_scope_t tile_scope(
-                                scope.register_allocator());
-                        r.emit(host, tile_scope, src_tile_rd, dst_tile_rd);
-                    });
+        auto src_tile_layout = src_layout_.map(tile);
+        auto dst_tile_layout = dst_layout_.map(tile);
+        if (!dst_tile_layout.is_dense()) return false;
+        auto layout_ok = [](const layout_t &l) {
+            if (l.blocks().size() < 2) return false;
+            for (auto &b : l.blocks()) {
+                if (math::is_pow2(b.block)) continue;
+                for (int i = 2; i < (int)b.block / 2; i++)
+                    if (b.block % i != 0) return false;
+            }
             return true;
+        };
+
+        if (!layout_ok(src_tile_layout)) return false;
+        if (!layout_ok(dst_tile_layout)) return false;
+
+        // Set layout offset to 0 since the offset is handled by fixing up the
+        // register input to try_emit_2d_impl
+        src_tile_layout.set_offset(0);
+        dst_tile_layout.set_offset(0);
+
+        bool ok = true;
+        auto type = to_ngen(src_layout_.type());
+        src_layout_.for_each_tile(tile, [&](const std::vector<dim_t> &start) {
+            auto src_off = src_layout_.offset_in_bytes<dim_t>(start);
+            auto dst_off = dst_layout_.offset_in_bytes<dim_t>(start);
+            auto src_tile_rd = src_rd.format(int(src_off), type);
+            auto dst_tile_rd = dst_rd.format(int(dst_off), type);
+
+            ngen_register_scope_t tile_scope(scope.register_allocator());
+            ok &= try_emit_2d_impl(host, tile_scope, src_tile_layout,
+                    dst_tile_layout, src_tile_rd, dst_tile_rd);
+        });
+        return ok;
+    }
+
+    template <typename GeneratorT>
+    bool try_emit_2d_impl(GeneratorT *host, ngen_register_scope_t &scope,
+            const layout_t &src_layout, const layout_t &dst_layout,
+            const reg_buf_data_t &src_rd, const reg_buf_data_t &dst_rd) {
+        // Try to allocate/release a temporary buffer to avoid out_of_registers
+        // exception.
+        const int grf_size = ngen::GRF::bytes(hw_);
+        auto dummy = scope.try_alloc_range(
+                utils::div_up(dst_layout.size(), grf_size));
+        if (dummy.isInvalid()) {
+            ir_warning() << "Can't allocate buffer for 2D reorder. Reorder "
+                            "performance may be suboptimal.\n";
+            return false;
         }
-        return false;
+
+        // Allocation succeeded, can proceed further.
+        scope.safeRelease(dummy);
+
+        reorder_2d_impl_t r(hw_, src_layout, dst_layout);
+        int tile_elems = int(r.tile().elems());
+        if (tile_elems < 16 || tile_elems > 512) return false;
+
+        r.emit(host, scope, src_rd, dst_rd);
+        return true;
     }
 
     static tensor_t find_max_tile_with_fixed_stride(const layout_t &src,

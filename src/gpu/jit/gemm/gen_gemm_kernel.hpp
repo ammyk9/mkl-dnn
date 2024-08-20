@@ -27,7 +27,6 @@
 #include "gpu/jit/gemm/kernel_evaluator.hpp"
 #include "gpu/jit/jit_generator_base.hpp"
 #include "gpu/jit/utils/ngen_type_bridge.hpp"
-#include "gpu/kernel_cache.hpp"
 #include "gpu/primitive_conf.hpp"
 
 namespace dnnl {
@@ -61,17 +60,6 @@ struct gen_gemm_kernel_desc_t {
         }
     }
 
-    status_t create_generator(
-            engine_t *engine, compute::compiled_kernel_t &generator) const;
-
-    serialized_t<gen_gemm_kernel_desc_t> serialize() const {
-        serialized_t<gen_gemm_kernel_desc_t> s {};
-        problem_.serialize(s);
-        strategy_.serialize(s);
-        return s;
-    }
-    compute::gpu_arch_t arch() const { return arch_; }
-
 protected:
     static Type convert_dnnl_to_kernel_type(data_type_t type) {
         switch (type) {
@@ -88,7 +76,6 @@ protected:
     static ngen::HW convert_dnnl_arch_to_hw(compute::gpu_arch_t arch) {
         switch (arch) {
             case compute::gpu_arch_t::gen9: return ngen::HW::Gen9;
-            case compute::gpu_arch_t::gen11: return ngen::HW::Gen11;
             case compute::gpu_arch_t::xe_lp: return ngen::HW::XeLP;
             case compute::gpu_arch_t::xe_hp: return ngen::HW::XeHP;
             case compute::gpu_arch_t::xe_hpg: return ngen::HW::XeHPG;
@@ -100,16 +87,17 @@ protected:
     compute::gpu_arch_t arch_;
     ngen::HW hw_ = ngen::HW::Unknown;
     int stepping_ = 0;
-    GEMMProblem problem_ = {};
-    GEMMStrategy strategy_ = {};
+    GEMMProblem problem_;
+    GEMMStrategy strategy_;
     const kcatalog::Entry *entry_ = nullptr;
     EvaluateAuxOutput aux_params_;
     CommonDriverInfo driver_info_;
 
+    bool a_offset_ = false, b_offset_ = false;
+
     /* optional information to fine-tune kernel */
     int m_ = -1, n_ = -1, k_ = -1;
     int eu_count_ = -1;
-    bool disable_systolic_ = false;
 
     status_t transfer_post_ops(
             const post_ops_t &post_ops, bool swap_ab = false);
@@ -122,18 +110,18 @@ struct gen_gemm_nocopy_kernel_desc_t : public gen_gemm_kernel_desc_t {
     enum compute_mode { mode_default = 0, mode_tf32 = 0x1, mode_bf16x1 = 0x2 };
 
     status_t select_kernel(compute::gpu_arch_t arch, int stepping, int eu_count,
-            bool has_systolic, compute_mode mode, int batch_dims, bool trans_a,
-            bool trans_b, bool trans_co, bool swap_ab, bool a_offset,
-            bool b_offset, bool c_offset, bool bias, sum_ab_t reduce_ab,
-            float alpha, float beta, const post_ops_t &post_ops,
-            data_type_t a_type, data_type_t b_type, data_type_t c_type,
-            data_type_t co_type, data_type_t acc_type, int align_a, int align_b,
-            int align_c, dim_t m, dim_t n, dim_t k, dim_t lda, dim_t ldb,
-            dim_t ldc, dim_t batch);
+            compute_mode mode, int batch_dims, bool trans_a, bool trans_b,
+            bool trans_co, bool swap_ab, bool a_offset, bool b_offset,
+            bool c_offset, bool bias, sum_ab_t reduce_ab, float alpha,
+            float beta, const post_ops_t &post_ops, data_type_t a_type,
+            data_type_t b_type, data_type_t c_type, data_type_t co_type,
+            data_type_t acc_type, int align_a, int align_b, int align_c,
+            dim_t m, dim_t n, dim_t k, dim_t lda, dim_t ldb, dim_t ldc,
+            dim_t batch);
 };
 
 struct gen_gemm_xe_systolic_kernel_desc_t : public gen_gemm_kernel_desc_t {
-    status_t select_kernel(compute::gpu_arch_t arch, int stepping, int eu_count,
+    status_t select_kernel(compute::gpu_arch_t arch, int eu_count,
             int batch_dims, bool packed_c, bool trans_co, bool a_offset,
             bool b_offset, bool c_offset, bool bias, float alpha, float beta,
             const post_ops_t &post_ops, data_type_t a_type, data_type_t b_type,
@@ -155,8 +143,7 @@ struct gen_gemm_kernel_t : public jit_generator_base {
         : desc_(desc) {}
 
     const char *kernel_name() const override { return "gemm_kernel"; }
-    gpu::compute::binary_t get_binary(
-            cl_context context, cl_device_id device) override;
+    cl_kernel get_kernel(cl_context context, cl_device_id device) override;
 
     const gen_gemm_kernel_desc_t *desc() const { return &desc_; }
 

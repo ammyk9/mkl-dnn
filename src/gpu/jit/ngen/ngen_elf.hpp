@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,9 +31,8 @@ class ELFCodeGenerator : public BinaryCodeGenerator<hw>
 public:
     inline std::vector<uint8_t> getBinary();
     static inline HW getBinaryArch(const std::vector<uint8_t> &binary);
-    static inline void getBinaryHWInfo(const std::vector<uint8_t> &binary, HW &outHW, Product &outProduct);
+    static inline void getBinaryHWInfo(const std::vector<uint8_t> &binary, HW &outHW, int &outStepping);
 
-    explicit ELFCodeGenerator(Product product_)  : BinaryCodeGenerator<hw>(product_) {}
     explicit ELFCodeGenerator(int stepping_ = 0) : BinaryCodeGenerator<hw>(stepping_) {}
 
 protected:
@@ -51,7 +50,7 @@ protected:
     void requireBarriers(int nbarriers)                                  { interface_.requireBarriers(nbarriers); }
     void requireDPAS()                                                   { interface_.requireDPAS(); }
     void requireGlobalAtomics()                                          { interface_.requireGlobalAtomics(); }
-    void requireGRF(int grfs)                                            { BinaryCodeGenerator<hw>::requireGRF(grfs); interface_.requireGRF(grfs); }
+    void requireGRF(int grfs)                                            { interface_.requireGRF(grfs); }
     void requireLocalID(int dimensions)                                  { interface_.requireLocalID(dimensions); }
     void requireLocalSize()                                              { interface_.requireLocalSize(); }
     void requireNonuniformWGs()                                          { interface_.requireNonuniformWGs(); }
@@ -72,12 +71,12 @@ protected:
     void newArgument(std::string name)                                   { interface_.newArgument<DT>(name); }
     void newArgument(std::string name, DataType type,
                      ExternalArgumentType exttype = ExternalArgumentType::Scalar,
-                     GlobalAccessType access = GlobalAccessType::Default)
+                     GlobalAccessType access = GlobalAccessType::All)
     {
         interface_.newArgument(name, type, exttype, access);
     }
     void newArgument(std::string name, ExternalArgumentType exttype,
-                     GlobalAccessType access = GlobalAccessType::Default)
+                     GlobalAccessType access = GlobalAccessType::All)
     {
         interface_.newArgument(name, exttype, access);
     }
@@ -271,7 +270,7 @@ private:
     };
 };
 
-#define NGEN_FORWARD_ELF(hw) NGEN_FORWARD_NO_REQGRF(hw) \
+#define NGEN_FORWARD_ELF(hw) NGEN_FORWARD(hw) \
 template <typename... Targs> void externalName(Targs&&... args) { ngen::ELFCodeGenerator<hw>::externalName(std::forward<Targs>(args)...); } \
 const std::string &getExternalName() const { return ngen::ELFCodeGenerator<hw>::getExternalName(); } \
 int getSIMD() const { return ngen::ELFCodeGenerator<hw>::getSIMD(); } \
@@ -361,21 +360,20 @@ template <HW hw>
 inline HW ELFCodeGenerator<hw>::getBinaryArch(const std::vector<uint8_t> &binary)
 {
     HW outHW;
-    Product outProduct;
+    int outStepping;
 
-    getBinaryHWInfo(binary, outHW, outProduct);
+    getBinaryHWInfo(binary, outHW, outStepping);
 
     return outHW;
 }
 
 template <HW hw>
-inline void ELFCodeGenerator<hw>::getBinaryHWInfo(const std::vector<uint8_t> &binary, HW &outHW, Product &outProduct)
+inline void ELFCodeGenerator<hw>::getBinaryHWInfo(const std::vector<uint8_t> &binary, HW &outHW, int &outStepping)
 {
     using Note = typename ZebinELF::Note;
 
     outHW = HW::Unknown;
-    outProduct.family = ProductFamily::Unknown;
-    outProduct.stepping = 0;
+    outStepping = 0;
 
     auto zebinELF = reinterpret_cast<const ZebinELF *>(binary.data());
     if (zebinELF->valid()) {
@@ -391,9 +389,9 @@ inline void ELFCodeGenerator<hw>::getBinaryHWInfo(const std::vector<uint8_t> &bi
                     );
                     switch (start->type) {
                         case Note::Type::ProductFamily: {
-                            auto decodedFamily = npack::decodeProductFamily(static_cast<npack::ProductFamily>(*actualPayload));
-                            if (decodedFamily != ProductFamily::Unknown)
-                                outProduct.family = decodedFamily;
+                            auto decodedHW = npack::decodeProductFamily(static_cast<npack::ProductFamily>(*actualPayload));
+                            if (decodedHW >= HW::Gen12LP)
+                                outHW = decodedHW;
                             break;
                         }
                         case Note::Type::GfxCoreFamily:
@@ -403,7 +401,7 @@ inline void ELFCodeGenerator<hw>::getBinaryHWInfo(const std::vector<uint8_t> &bi
                         case Note::Type::TargetMetadata: {
                             typename ZebinELF::TargetMetadata metadata;
                             metadata.all = *actualPayload;
-                            outProduct.stepping = metadata.parts.minHWRevision;
+                            outStepping = metadata.parts.minHWRevision;
                         }
                         default: break;
                     }
@@ -418,16 +416,11 @@ inline void ELFCodeGenerator<hw>::getBinaryHWInfo(const std::vector<uint8_t> &bi
             if (zebinELF->fileHeader.flags.parts.useGfxCoreFamily)
                 outHW = npack::decodeGfxCoreFamily(static_cast<npack::GfxCoreFamily>(zebinELF->fileHeader.machine));
             else
-                outProduct.family = npack::decodeProductFamily(static_cast<npack::ProductFamily>(zebinELF->fileHeader.machine));
-            outProduct.stepping = zebinELF->fileHeader.flags.parts.minHWRevision;
+                outHW = npack::decodeProductFamily(static_cast<npack::ProductFamily>(zebinELF->fileHeader.machine));
+            outStepping = zebinELF->fileHeader.flags.parts.minHWRevision;
         }
     } else
-        npack::getBinaryHWInfo(binary, outHW, outProduct);
-
-    if (outHW != HW::Unknown && outProduct.family == ProductFamily::Unknown)
-        outProduct.family = genericProductFamily(outHW);
-    else if (outHW == HW::Unknown && outProduct.family != ProductFamily::Unknown)
-        outHW = getCore(outProduct.family);
+        npack::getBinaryHWInfo(binary, outHW, outStepping);
 }
 
 } /* namespace ngen */

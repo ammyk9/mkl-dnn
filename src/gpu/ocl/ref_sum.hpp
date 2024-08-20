@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 
 #ifndef GPU_OCL_REF_SUM_HPP
 #define GPU_OCL_REF_SUM_HPP
-
-#include <mutex>
 
 #include "common/primitive.hpp"
 #include "common/reorder.hpp"
@@ -51,8 +49,8 @@ struct ref_sum_t : public gpu_primitive_t {
             reorder_pds_.resize(n_ + need_output_reorder());
             for (int i = 0; i < n_; ++i) {
                 primitive_attr_t r_attr;
-                CHECK(r_attr.scales_.set(DNNL_ARG_SRC, 0));
-                if (i != 0) CHECK(r_attr.post_ops_.append_sum(1.0));
+                r_attr.scales_.set(DNNL_ARG_SRC, 0);
+                if (i != 0) r_attr.post_ops_.append_sum(1.0);
 
                 CHECK(reorder_primitive_desc_create(reorder_pds_[i], engine,
                         src_md(i), dst_acc_md(), &r_attr));
@@ -104,11 +102,6 @@ struct ref_sum_t : public gpu_primitive_t {
 
     status_t init_res_storage(
             engine_t *engine, gpu_resource_t *r) const override {
-        // TODO: this is a dirty fix to a real problem that pops up when
-        // multiple threads creating this primitive. Execution hangs at unmap().
-        static std::mutex mutex;
-        std::lock_guard<std::mutex> lock(mutex);
-
         const dim_t count = pd()->n_inputs();
         const float *s_data = pd()->scales();
         for (dim_t i = 0; i < count; i++) {
@@ -153,8 +146,7 @@ struct ref_sum_t : public gpu_primitive_t {
         for (int i = 0; i < n; ++i) {
             memory_t scales_mem(
                     ctx.stream()->engine(), &pd()->scale_md_, nullptr);
-            CHECK(scales_mem.set_data_handle(
-                    CTX_GPU_RES_STORAGE(i).data_handle()));
+            scales_mem.set_data_handle(CTX_GPU_RES_STORAGE(i).data_handle());
             r_args[DNNL_ARG_SRC] = ctx.args().at(DNNL_ARG_MULTIPLE_SRC + i);
             r_args[DNNL_ARG_DST] = pd()->need_output_reorder() ? dst_acc : dst;
             r_args[DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC] = {&scales_mem, true};
@@ -164,7 +156,7 @@ struct ref_sum_t : public gpu_primitive_t {
             r_ctx.set_scratchpad_grantor(ns.grantor());
             CHECK(reorders_[i]->execute(r_ctx));
 #ifndef DNNL_SYCL_CUDA
-            CHECK(ctx.stream()->wait());
+            ctx.stream()->wait();
 #endif
         }
 

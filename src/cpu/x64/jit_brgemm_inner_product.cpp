@@ -56,7 +56,6 @@ void copy_data_chunk(ker_type &ker, char *tr_data, const char *data,
     ctx.last_row_blk = is_last_blk ? 1 : 0;
     (*ker)(&ctx);
 }
-
 } // namespace
 
 template <cpu_isa_t isa>
@@ -84,6 +83,8 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     const float *oscales = precompute_scales(ctx.get_scratchpad_grantor(),
             src_scales, wei_scales, pd()->OC(), pd()->attr());
 
+    const bool is_f32 = everyone_is(f32, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt);
+
     const size_t src_dt_size = types::data_type_size(jbgp.src_dt);
     const size_t bia_dt_size
             = jbgp.with_bias ? types::data_type_size(jbgp.bia_dt) : 0;
@@ -108,12 +109,12 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
     const bool are_post_ops_applicable = one_of(true, jbgp.with_sum,
             jbgp.with_bias, jbgp.with_scales, jbgp.with_eltwise,
-            jbgp.with_binary, jbgp.acc_dt != jbgp.dst_dt,
-            jbgp.req_s8s8_compensation, jbgp.with_dst_scales);
+            jbgp.with_binary, jbgp.acc_dt != jbgp.dst_dt, jbgp.signed_input,
+            jbgp.with_dst_scales);
 
     size_t offset = types::data_type_size(jbgp.wei_dt)
             * (weights_d.size() - weights_d.additional_buffer_size());
-    auto compensation = jbgp.req_s8s8_compensation
+    auto compensation = (jbgp.signed_input)
             ? reinterpret_cast<const int32_t *>(&weights[offset])
             : nullptr;
 
@@ -121,18 +122,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     bool is_oc_tail = (jbgp.oc < jbgp.oc_block);
     int base_brg_ker_idx = brgemm_inner_product_utils::
             get_brg_kernel_index( // TODO: Can be calculated on initialization stage
-                    false, false, is_os_tail, is_oc_tail, false);
-    const dims_t ic_dims = {0, jbgp.ic_block, 0, 0, 0};
-    const auto wei_ic_stride
-            = types::data_type_size(jbgp.wei_dt) * weights_d.off_v(ic_dims);
+                    jbgp, false, false, is_os_tail, is_oc_tail, false);
 
-    const auto ker = [&](int ithr_oc_mb, int nthr_oc_mb, int ithr_ic, int osb,
-                             int osb_s, int ocb, int ocb_s, int icc, int icc_s,
-                             bool copy_buffer_a, int &prev_ker_idx) {
-        const int cur_ocb = ocb + ocb_s;
-        const int cur_osb = osb + osb_s;
-        const int cur_icc = icc + icc_s;
-        const int n = cur_osb * jbgp.os_block;
+    const auto ker = [&](int ithr_oc_mb, int nthr_oc_mb, int ithr_ic, int n,
+                             int ocb, int icc, bool do_init, int buffer_a_osb,
+                             bool copy_buffer_a) {
         const int ithr = nthr_oc_mb * ithr_ic + ithr_oc_mb;
         auto addr_batch = addr_batch_global + ithr * jbgp.adjusted_batch_size;
 
@@ -140,11 +134,12 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                 = src_dt_size * jbgp.LDA * jbgp.os_block;
         const size_t a_buffer_per_thr
                 = a_buffer_osb_stride * jbgp.nb_os_blocking;
-        auto a_buffer = (jbgp.use_buffer_a) ? a_buffer_global
-                        + ithr * a_buffer_per_thr + osb * a_buffer_osb_stride
-                                            : nullptr;
+        auto a_buffer = (jbgp.use_buffer_a)
+                ? a_buffer_global + ithr * a_buffer_per_thr
+                        + buffer_a_osb * a_buffer_osb_stride
+                : nullptr;
 
-        const int oc = cur_ocb * jbgp.oc_block;
+        const int oc = ocb * jbgp.oc_block;
         const size_t dst_off = get_blk_off(dst_d, jbgp.dst_dt, n, oc);
 
         const bool use_c_buffer = (jbgp.with_sum)
@@ -152,65 +147,31 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         char *c_buffer = nullptr;
         if (use_c_buffer) {
-            size_t c_buf_idx = 0;
-            size_t c_buf_nrows = 0;
-            size_t c_buf_walk = 0;
-
-            if (jbgp.nthr_ic_b > 1) {
-                c_buf_idx = ithr_ic - 1;
-                c_buf_idx += jbgp.acc_dt != jbgp.dst_dt || jbgp.with_sum;
-                c_buf_nrows = jbgp.mb;
-
-                // NOTE: This trick only works because the leading dimension of
-                // buffer and memory descriptor is same.
-                c_buf_walk = dst_off / dst_dt_size;
-            } else {
-                using loop_order_t = jit_brgemm_ip_fwd_conf_t::loop_order_t;
-                switch (jbgp.loop_order) {
-                    case loop_order_t::osc_occ_osb_ocb_icc:
-                        c_buf_idx = ithr;
-                        c_buf_nrows = jbgp.M;
-
-                        // Single small block buffer, no walk needed.
-                        c_buf_walk = 0;
-                        break;
-                    case loop_order_t::osc_occ_icc_osb_ocb:
-                        c_buf_idx = ithr;
-                        c_buf_nrows = jbgp.os_block * jbgp.nb_os_blocking;
-
-                        // Walk for each block in os/oc-chunk.
-                        c_buf_walk = osb * jbgp.os_block * jbgp.LDC
-                                + ocb * jbgp.oc_block;
-                        break;
-                    case loop_order_t::icc_osc_occ_osb_ocb:
-                    case loop_order_t::icc_occ_osc_ocb_osb:
-                        c_buf_idx = 0;
-                        c_buf_nrows = jbgp.os;
-
-                        // NOTE: This trick only works because the leading
-                        // dimension of buffer and memory descriptor is same.
-                        c_buf_walk = dst_off / dst_dt_size;
-                        break;
-                }
-            }
-
-            size_t c_buf_shift = c_buf_idx * c_buf_nrows * jbgp.LDC;
-            c_buf_shift += c_buf_walk;
-            size_t c_buf_off = acc_dt_size * c_buf_shift;
-            c_buffer = c_buffer_global + c_buf_off;
+            const size_t c_buf_thr_idx = jbgp.nthr_ic_b <= 1
+                    ? ithr
+                    : (jbgp.acc_dt != jbgp.dst_dt || jbgp.with_sum
+                                    ? ithr_ic
+                                    : ithr_ic - 1);
+            const size_t c_buf_num_rows = jbgp.nthr_ic_b > 1 ? jbgp.mb : jbgp.M;
+            const size_t c_buffer_shift
+                    = c_buf_thr_idx * c_buf_num_rows * jbgp.LDC;
+            const size_t c_buffer_off = acc_dt_size * c_buffer_shift
+                    + (jbgp.nthr_ic_b > 1 ? acc_dt_size * dst_off / dst_dt_size
+                                          : 0);
+            c_buffer = c_buffer_global + c_buffer_off;
         }
 
         char *wsp_tile = is_amx
                 ? wsp_tile_base + ithr * jbgp.amx_buf_size_per_thread
                 : nullptr;
-        int icb = cur_icc * jbgp.nb_ic_blocking;
+        int icb = icc * jbgp.nb_ic_blocking;
         int ic = icb * jbgp.ic_block;
 
-        bool kernel_init = cur_icc == icc_s;
+        bool kernel_init = do_init;
 
         bool is_os_tail = (jbgp.mb - n < jbgp.os_block);
         bool is_oc_tail = (jbgp.oc - oc < jbgp.oc_block);
-        bool is_last_ic_chunk = cur_icc == ic_chunks - 1;
+        bool is_last_ic_chunk = icc == ic_chunks - 1;
         bool is_ic_tail = is_last_ic_chunk && jbgp.K_tail > 0;
         const int remaining_ic_blks
                 = (jbgp.use_buffer_a ? utils::rnd_up(jbgp.ic, jbgp.ic_block)
@@ -221,11 +182,8 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         auto is_bs_tail = (gemm_batch != jbgp.gemm_batch_size);
         int brg_ker_idx = brgemm_inner_product_utils::get_brg_kernel_index(
-                is_bs_tail, kernel_init, is_os_tail, is_oc_tail, false);
+                jbgp, is_bs_tail, kernel_init, is_os_tail, is_oc_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
-        const int ic_blocks_per_batch = jbgp.K / jbgp.ic_block;
-        const dim_t wei_cur_ocb
-                = get_blk_off(weights_d, jbgp.wei_dt, cur_ocb, 0);
 
         if (copy_buffer_a) {
             assert(!jbgp.is_bf32);
@@ -234,8 +192,9 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                     is_os_tail ? jbgp.mb - n : jbgp.os_block, is_last_ic_chunk);
         }
         if (gemm_batch > 0 && brg_kernel != nullptr) {
-            brgemm_palettes_.maybe_tile_configure(
-                    is_amx, prev_ker_idx, brg_ker_idx);
+            if (is_amx && (is_os_tail || is_oc_tail))
+                amx_tile_configure(&brg_kernel_palettes_[brg_ker_idx][0]);
+            const int ic_blocks_per_batch = jbgp.K / jbgp.ic_block;
             for (int b = 0; b < gemm_batch; b++) {
                 auto A_ptr = jbgp.use_buffer_a
                         ? (a_buffer + src_dt_size * b * jbgp.K)
@@ -243,9 +202,9 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                                 + get_blk_off(src_d, jbgp.src_dt, n,
                                         ic + b * jbgp.K));
                 addr_batch[b].ptr.A = A_ptr;
-                const dim_t wei_offset = wei_cur_ocb
-                        + wei_ic_stride * (icb + b * ic_blocks_per_batch);
-                addr_batch[b].ptr.B = weights + wei_offset;
+                addr_batch[b].ptr.B = weights
+                        + get_blk_off(weights_d, jbgp.wei_dt, ocb,
+                                icb + b * ic_blocks_per_batch);
             }
 
             auto ptr_D = dst + dst_off;
@@ -255,9 +214,9 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                     && is_last_ic_chunk && !is_ic_tail) {
                 void *scratch = is_amx
                         ? static_cast<void *>(wsp_tile)
-                        : (jbgp.req_s8s8_compensation ? static_cast<void *>(
+                        : (jbgp.signed_input ? static_cast<void *>(
                                    const_cast<int *>(&compensation[oc]))
-                                                      : nullptr);
+                                             : nullptr);
                 auto ptr_bias
                         = jbgp.with_bias ? bias + bia_dt_size * oc : nullptr;
                 const brgemm_post_ops_data_t post_ops_data {
@@ -274,34 +233,34 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                 brgemm_kernel_execute(brg_kernel, gemm_batch, addr_batch,
                         (void *)ptr_C, is_amx ? (void *)wsp_tile : nullptr);
             }
+
+            if (is_amx && (is_os_tail || is_oc_tail))
+                amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
         }
 
         if (is_ic_tail) {
             assert(!jbgp.use_buffer_a);
-            auto use_init_ker = (kernel_init && gemm_batch == 0);
-            int brg_ker_ic_tail_idx
-                    = brgemm_inner_product_utils::get_brg_kernel_index(
-                            false, use_init_ker, is_os_tail, is_oc_tail, true);
-            brgemm_palettes_.maybe_tile_configure(
-                    is_amx, prev_ker_idx, brg_ker_ic_tail_idx);
-
-            int ic_block = gemm_batch * ic_blocks_per_batch;
+            int ic_block = gemm_batch * jbgp.K / jbgp.ic_block;
             addr_batch[0].ptr.A = src
                     + get_blk_off(src_d, jbgp.src_dt, n,
                             ic + ic_block * jbgp.ic_block);
-            const dim_t wei_offset
-                    = wei_cur_ocb + wei_ic_stride * (icb + ic_block);
-            addr_batch[0].ptr.B = weights + wei_offset;
+            addr_batch[0].ptr.B = weights
+                    + get_blk_off(weights_d, jbgp.wei_dt, ocb, icb + ic_block);
 
-            auto brg_kernel_ic_tail = brg_kernels_[brg_ker_ic_tail_idx].get();
+            auto use_init_ker = (kernel_init && gemm_batch == 0);
+            int brg_ker_idx = brgemm_inner_product_utils::get_brg_kernel_index(
+                    jbgp, false, use_init_ker, is_os_tail, is_oc_tail, true);
+            auto brg_kernel_ic_tail = brg_kernels_[brg_ker_idx].get();
+            if (is_amx)
+                amx_tile_configure(&brg_kernel_palettes_[brg_ker_idx][0]);
             auto ptr_D = dst + dst_off;
             auto ptr_C = use_c_buffer ? c_buffer : ptr_D;
             if (jbgp.nthr_ic_b == 1 && are_post_ops_applicable) {
                 void *scratch = is_amx
                         ? static_cast<void *>(wsp_tile)
-                        : (jbgp.req_s8s8_compensation ? static_cast<void *>(
+                        : (jbgp.signed_input ? static_cast<void *>(
                                    const_cast<int *>(&compensation[oc]))
-                                                      : nullptr);
+                                             : nullptr);
                 auto ptr_bias
                         = jbgp.with_bias ? bias + bia_dt_size * oc : nullptr;
                 const brgemm_post_ops_data_t post_ops_data {
@@ -317,6 +276,8 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                 brgemm_kernel_execute(brg_kernel_ic_tail, 1, addr_batch,
                         (void *)ptr_C, is_amx ? (void *)wsp_tile : nullptr);
             }
+            if (is_amx)
+                amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
         }
     };
 
@@ -341,16 +302,15 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     // not create parallel section at all. We do not limit num_threads
     // for 1 < work_amount < dnnl_get_max_threads() case to avoid potential
     // overhead on spawning different number of OMP threads from layer to layer.
-    const int num_threads
-            = work_amount == 1 && jbgp.nthr_ic_b <= 1 ? 1 : jbgp.nthr;
+    const int num_threads = (work_amount == 1 ? 1 : jbgp.nthr);
     parallel(num_threads, [&](const int ithr, const int nthr) {
         int nthr_ic {1}, nthr_oc_mb {1}, ithr_ic {0}, ithr_oc_mb {0};
         bool ok = init_thr_groups(
                 ithr, nthr, nthr_ic, nthr_oc_mb, ithr_ic, ithr_oc_mb);
         if (!ok) return;
 
-        int start_init {0}, end {0};
-        balance211(work_amount, nthr_oc_mb, ithr_oc_mb, start_init, end);
+        int start {0}, end {0};
+        balance211(work_amount, nthr_oc_mb, ithr_oc_mb, start, end);
 
         int icc_start {0}, icc_end {ic_chunks};
         if (nthr_ic > 1)
@@ -358,26 +318,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
         const int icc_work = icc_end - icc_start;
 
-        const auto order = jbgp.loop_order;
+        if (is_amx)
+            amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
 
-        int prev_ker_idx = -1;
-        brgemm_palettes_.maybe_tile_configure(
-                is_amx, prev_ker_idx, base_brg_ker_idx);
-
-        int icc {0}, occ {0}, osc {0};
-        int start {start_init};
-        using loop_order_t = jit_brgemm_ip_fwd_conf_t::loop_order_t;
-
-        switch (order) {
-            case loop_order_t::osc_occ_icc_osb_ocb:
-            case loop_order_t::osc_occ_osb_ocb_icc:
-            case loop_order_t::icc_osc_occ_osb_ocb:
-                nd_iterator_init(start, osc, os_chunks, occ, oc_chunks);
-                break;
-            case loop_order_t::icc_occ_osc_ocb_osb:
-                nd_iterator_init(start, occ, oc_chunks, osc, os_chunks);
-                break;
-        }
+        int occ {0}, osc {0};
+        nd_iterator_init(start, osc, os_chunks, occ, oc_chunks);
         while (start < end) {
             int ocb_s = occ * jbgp.nb_oc_blocking;
             int ocb_e = nstl::min(ocb_s + jbgp.nb_oc_blocking, jbgp.nb_oc);
@@ -388,103 +333,44 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
             int osb_work = osb_e - osb_s;
 
             // Each thread runs the below loops:
-            int loop_start = 0, loop_end = 0;
-            switch (order) {
-                case loop_order_t::osc_occ_icc_osb_ocb:
-                case loop_order_t::osc_occ_osb_ocb_icc:
-                    loop_end = icc_work * osb_work * ocb_work;
-                    break;
-                case loop_order_t::icc_occ_osc_ocb_osb:
-                case loop_order_t::icc_osc_occ_osb_ocb:
-                    loop_end = osb_work * ocb_work;
-                    break;
-            }
+            int loop_start = 0, loop_end = icc_work * osb_work * ocb_work;
+            int icc = 0, osb = 0, ocb = 0;
 
-            int osb = 0, ocb = 0;
-            switch (order) {
-                case loop_order_t::osc_occ_icc_osb_ocb:
-                    nd_iterator_init(
-                            0, icc, icc_work, osb, osb_work, ocb, ocb_work);
-                    break;
-                case loop_order_t::osc_occ_osb_ocb_icc:
-                    nd_iterator_init(
-                            0, osb, osb_work, ocb, ocb_work, icc, icc_work);
-                    break;
-                case loop_order_t::icc_osc_occ_osb_ocb:
-                    nd_iterator_init(0, osb, osb_work, ocb, ocb_work);
-                    break;
-                case loop_order_t::icc_occ_osc_ocb_osb:
-                    nd_iterator_init(0, ocb, ocb_work, osb, osb_work);
-                    break;
-            }
+            // If buffer is required, then inner-most loop will be over icc_work
+            const bool ocb_inner_most
+                    = is_f32 && !(jbgp.is_bf32 || jbgp.use_buffer);
+            if (ocb_inner_most)
+                nd_iterator_init(
+                        0, icc, icc_work, osb, osb_work, ocb, ocb_work);
+            else
+                nd_iterator_init(
+                        0, osb, osb_work, ocb, ocb_work, icc, icc_work);
 
             while (loop_start < loop_end) {
-                const bool ocb_inner_most
-                        = order == loop_order_t::osc_occ_icc_osb_ocb;
-
+                const int n = (osb + osb_s) * jbgp.os_block;
+                const int cur_icc = icc + icc_start;
                 const bool copy_buffer_a = jbgp.use_buffer_a
                         && IMPLICATION(ocb_inner_most, ocb == 0);
-                ker(ithr_oc_mb, nthr_oc_mb, ithr_ic, osb, osb_s, ocb, ocb_s,
-                        icc, icc_start, copy_buffer_a, prev_ker_idx);
+                ker(ithr_oc_mb, nthr_oc_mb, ithr_ic, n, ocb + ocb_s, cur_icc,
+                        cur_icc == icc_start, osb, copy_buffer_a);
 
                 ++loop_start;
-                switch (order) {
-                    case loop_order_t::osc_occ_icc_osb_ocb:
-                        nd_iterator_step(
-                                icc, icc_work, osb, osb_work, ocb, ocb_work);
-                        break;
-                    case loop_order_t::osc_occ_osb_ocb_icc:
-                        nd_iterator_step(
-                                osb, osb_work, ocb, ocb_work, icc, icc_work);
-                        break;
-                    case loop_order_t::icc_osc_occ_osb_ocb:
-                        nd_iterator_step(osb, osb_work, ocb, ocb_work);
-                        break;
-                    case loop_order_t::icc_occ_osc_ocb_osb:
-                        nd_iterator_step(ocb, ocb_work, osb, osb_work);
-                        break;
-                }
+                if (ocb_inner_most)
+                    nd_iterator_step(
+                            icc, icc_work, osb, osb_work, ocb, ocb_work);
+                else
+                    nd_iterator_step(
+                            osb, osb_work, ocb, ocb_work, icc, icc_work);
             }
 
             ++start;
-            switch (order) {
-                case loop_order_t::osc_occ_icc_osb_ocb:
-                case loop_order_t::osc_occ_osb_ocb_icc:
-                    nd_iterator_step(osc, os_chunks, occ, oc_chunks);
-                    break;
-                case loop_order_t::icc_osc_occ_osb_ocb:
-                    nd_iterator_step(osc, os_chunks, occ, oc_chunks);
-                    if (start == end) {
-                        icc++;
-                        if (icc < icc_work) {
-                            start = start_init;
-                            nd_iterator_init(
-                                    start, osc, os_chunks, occ, oc_chunks);
-                        }
-                    }
-                    break;
-                case loop_order_t::icc_occ_osc_ocb_osb:
-                    nd_iterator_step(occ, oc_chunks, osc, os_chunks);
-                    if (start == end) {
-                        icc++;
-                        if (icc < icc_work) {
-                            start = start_init;
-                            nd_iterator_init(
-                                    start, occ, oc_chunks, osc, os_chunks);
-                        }
-                    }
-                    break;
-            }
+            nd_iterator_step(osc, os_chunks, occ, oc_chunks);
         }
         if (is_amx) amx_tile_release();
     });
 
     if (jbgp.nthr_ic_b > 1) {
-        const bool is_f32
-                = everyone_is(f32, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt);
-        const bool is_f32_compute = is_f32 && !jbgp.is_bf32;
-        MAYBE_UNUSED(is_f32_compute);
-        assert(jbgp.use_buffer && is_f32_compute);
+        assert(jbgp.use_buffer && is_f32);
 
         const auto get_dst_reduced_off = [&](int ithr_ic, int osb, int ocb) {
             assert(jbgp.nthr_ic_b > 1);
@@ -508,8 +394,6 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
             balance211(
                     work_amount, nthr_oc_mb, ithr_oc_mb, ocmb_start, ocmb_end);
             balance211(ocmb_end - ocmb_start, nthr_ic, ithr_ic, start, end);
-
-            int prev_ker_idx = -1;
 
             int occ {0}, osc {0};
             nd_iterator_init(
@@ -547,10 +431,8 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
                                     = (jbgp.oc - ocb * jbgp.oc_block
                                             < jbgp.oc_block);
                             const int brg_ker_idx = brgemm_inner_product_utils::
-                                    get_brg_kernel_index(false, false,
+                                    get_brg_kernel_index(jbgp, false, false,
                                             is_os_tail, is_oc_tail, false);
-                            brgemm_palettes_.maybe_tile_configure(
-                                    is_amx, prev_ker_idx, brg_ker_idx);
                             const auto brg_kernel
                                     = brg_kernels_[brg_ker_idx].get();
                             const int os = osb * jbgp.os_block;
@@ -569,10 +451,10 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
 
                             void *scratch = is_amx
                                     ? static_cast<void *>(wsp_tile)
-                                    : (jbgp.req_s8s8_compensation ? static_cast<
-                                                    void *>(const_cast<int *>(
-                                               &compensation[oc]))
-                                                                  : nullptr);
+                                    : (jbgp.signed_input ? static_cast<void *>(
+                                               const_cast<int *>(
+                                                       &compensation[oc]))
+                                                         : nullptr);
 
                             const brgemm_post_ops_data_t post_ops_data {
                                     static_cast<const void *>(ptr_bias),
@@ -597,8 +479,6 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     return status::success;
 }
 
-template struct brgemm_inner_product_fwd_t<avx2>;
-template struct brgemm_inner_product_fwd_t<avx2_vnni>;
 template struct brgemm_inner_product_fwd_t<avx2_vnni_2>;
 template struct brgemm_inner_product_fwd_t<avx512_core>;
 template struct brgemm_inner_product_fwd_t<avx512_core_bf16>;
@@ -654,21 +534,20 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
             : nullptr;
 
     const int oc_chunks = div_up(jbgp.nb_oc, jbgp.nb_oc_blocking);
+    bool is_os_tail = (jbgp.mb < jbgp.os_block);
+    bool is_ic_tail = (jbgp.ic < jbgp.ic_block);
+    bool is_oc_tail = (jbgp.oc < jbgp.oc_block) && !jbgp.use_buffer_a;
 
     const dim_t acc_dt_sz = types::data_type_size(jbgp.acc_dt);
     const dim_t src_dt_sz = types::data_type_size(jbgp.src_dt);
 
-    bool is_os_tail = (jbgp.mb < jbgp.os_block);
-    bool is_ic_tail = (jbgp.ic < jbgp.ic_block);
-    bool is_oc_tail = (jbgp.oc < jbgp.oc_block) && !jbgp.use_buffer_a;
     const int base_brg_ker_idx = brgemm_inner_product_utils::
             get_brg_kernel_index( // TODO: Can be calculated on initialization stage
-                    false, false, is_os_tail, is_ic_tail, is_oc_tail);
+                    jbgp, false, false, is_os_tail, is_ic_tail, is_oc_tail);
 
     const int os_chunks = div_up(jbgp.nb_os, jbgp.nb_os_blocking);
     const int work_amount = jbgp.nb_ic * os_chunks;
-    const int num_threads
-            = work_amount == 1 && jbgp.nthr_oc_b <= 1 ? 1 : jbgp.nthr;
+    const int num_threads = (work_amount == 1 ? 1 : jbgp.nthr);
 
     const auto get_weights_ptr = [&](int icb, int ocb) {
         int fwd_ic_block
@@ -686,11 +565,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
             case OI16i64o2i:
             case OIw16i64o2i:
             case OIhw16i64o2i:
-            case OIdhw16i64o2i: fwd_oc_block = 64; break;
-            case OI16i48o:
-            case OIw16i48o:
-            case OIhw16i48o:
-            case OIdhw16i48o: fwd_oc_block = 48; break;
+            case OIdhw16i64o2i: fwd_oc_block = 4 * jbgp.simd_w; break;
             case OI16i32o:
             case OIw16i32o:
             case OIhw16i32o:
@@ -702,15 +577,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
             case OI16i32o2i:
             case OIw16i32o2i:
             case OIhw16i32o2i:
-            case OIdhw16i32o2i: fwd_oc_block = 32; break;
-            case OI8i24o:
-            case OIw8i24o:
-            case OIhw8i24o:
-            case OIdhw8i24o: fwd_oc_block = 24; break;
-            case OI8i16o:
-            case OIw8i16o:
-            case OIhw8i16o:
-            case OIdhw8i16o: fwd_oc_block = 16; break;
+            case OIdhw16i32o2i: fwd_oc_block = 2 * jbgp.simd_w; break;
             default: fwd_oc_block = jbgp.simd_w;
         };
         int fwd_icb = icb * jbgp.ic_block / fwd_ic_block;
@@ -742,7 +609,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
 
     const auto ker = [&](int ithr_ic_mb, int nthr_ic_mb, int ithr_oc,
                              int nthr_oc, int n, int icb, int occ, bool do_init,
-                             bool do_b_transpose, int &prev_ker_idx) {
+                             bool do_b_transpose) {
         const int ithr = nthr_ic_mb * ithr_oc + ithr_ic_mb;
         brgemm_batch_element_t *addr_batch
                 = addr_batch_global + ithr * jbgp.adjusted_batch_size;
@@ -793,13 +660,13 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
 
         auto is_bs_tail = (nb_oc_b != jbgp.nb_oc_blocking);
         const int brg_ker_idx
-                = brgemm_inner_product_utils::get_brg_kernel_index(
+                = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
                         is_bs_tail, kernel_init, is_os_tail, is_ic_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
 
         const int size_B = jbgp.LDB * rnd_up(jbgp.K, 2);
 
-        const size_t b_buf_shift = jbgp.global_b_transpose
+        const size_t b_buf_shift = jbgp.ip_bwd_d_global_b_transpose
                 ? icb * jbgp.nb_oc + ocb
                 : ithr * jbgp.gemm_batch_size;
         const size_t b_buf_off = buf_dt_size * b_buf_shift * size_B;
@@ -814,8 +681,9 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                     is_os_tail ? jbgp.os - n : jbgp.os_block, is_last_oc_chunk);
 
         if (nb_oc_b > 0 && brg_kernel != nullptr) {
-            brgemm_palettes_.maybe_tile_configure(
-                    is_amx, prev_ker_idx, brg_ker_idx);
+            if (is_amx && (is_os_tail || is_ic_tail))
+                amx_tile_configure(&brg_kernel_palettes_[brg_ker_idx][0]);
+
             for (int oc_block = 0; oc_block < nb_oc_b; oc_block++) {
                 addr_batch[oc_block].ptr.A = jbgp.use_buffer_a ? a_buffer
                                 + oc_block * jbgp.oc_block
@@ -825,7 +693,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                                         oc + oc_block * jbgp.oc_block);
                 addr_batch[oc_block].ptr.B
                         = b_buffer + buf_dt_size * (oc_block * size_B);
-                if (!jbgp.global_b_transpose && do_b_transpose)
+                if (!jbgp.ip_bwd_d_global_b_transpose && do_b_transpose)
                     transform_b_chunk((char *)addr_batch[oc_block].ptr.B,
                             get_weights_ptr(icb, ocb + oc_block), 1,
                             is_ic_tail ? jbgp.ic % jbgp.ic_block
@@ -846,30 +714,33 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                 brgemm_kernel_execute(brg_kernel, nb_oc_b, addr_batch,
                         (void *)ptr_C, is_amx ? (void *)wsp_tile : nullptr);
             }
+            if (is_amx && (is_os_tail || is_ic_tail))
+                amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
         }
         if (is_oc_tail) {
             assert(!jbgp.use_buffer_a);
-            auto use_init_ker = (kernel_init && nb_oc_b == 0);
-            const int brg_kernel_oc_tail_idx
-                    = brgemm_inner_product_utils::get_brg_kernel_index(
-                            false, use_init_ker, is_os_tail, is_ic_tail, true);
-            brgemm_palettes_.maybe_tile_configure(
-                    is_amx, prev_ker_idx, brg_kernel_oc_tail_idx);
 
             const int oc_block = nb_oc_b;
             addr_batch[0].ptr.A = diff_dst
                     + get_blk_off(diff_dst_d, jbgp.dst_dt, n,
                             oc + oc_block * jbgp.oc_block);
             addr_batch[0].ptr.B = b_buffer + buf_dt_size * (oc_block * size_B);
-            if (!jbgp.global_b_transpose && do_b_transpose) {
+            if (!jbgp.ip_bwd_d_global_b_transpose && do_b_transpose) {
                 transform_b_chunk((char *)addr_batch[0].ptr.B,
                         get_weights_ptr(icb, ocb + oc_block), 1,
                         is_ic_tail ? jbgp.ic % jbgp.ic_block : jbgp.ic_block,
                         jbgp.K_tail);
             }
 
+            auto use_init_ker = (kernel_init && nb_oc_b == 0);
+            const int brg_kernel_oc_tail_idx
+                    = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                            false, use_init_ker, is_os_tail, is_ic_tail, true);
             auto brg_kernel_oc_tail
                     = brg_kernels_[brg_kernel_oc_tail_idx].get();
+            if (is_amx)
+                amx_tile_configure(
+                        &brg_kernel_palettes_[brg_kernel_oc_tail_idx][0]);
             if (jbgp.use_buffer && jbgp.nthr_oc_b <= 1) {
                 void *scratch
                         = is_amx ? static_cast<void *>(wsp_tile) : nullptr;
@@ -882,11 +753,14 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                 brgemm_kernel_execute(brg_kernel_oc_tail, 1, addr_batch,
                         (void *)ptr_C, is_amx ? (void *)wsp_tile : nullptr);
             }
+            if (is_amx)
+                amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
         }
     };
 
-    if (jbgp.global_b_transpose && jbgp.use_buffer_b) {
-        assert(IMPLICATION(jbgp.global_b_transpose, jbgp.nthr_oc_b == 1));
+    if (jbgp.ip_bwd_d_global_b_transpose && jbgp.use_buffer_b) {
+        assert(IMPLICATION(
+                jbgp.ip_bwd_d_global_b_transpose, jbgp.nthr_oc_b == 1));
         parallel(num_threads, [&](const int ithr, const int nthr) {
             int start {0}, end {0};
             int max_ch_block = nstl::max(jbgp.ic_block, jbgp.oc_block);
@@ -942,9 +816,8 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
         if (nthr_oc > 1)
             balance211(oc_chunks, nthr_oc, ithr_oc, occ_start, occ_end);
 
-        int prev_ker_idx = -1;
-        brgemm_palettes_.maybe_tile_configure(
-                is_amx, prev_ker_idx, base_brg_ker_idx);
+        if (is_amx)
+            amx_tile_configure(&brg_kernel_palettes_[base_brg_ker_idx][0]);
 
         int icb {0}, oss {0};
         nd_iterator_init(start, oss, os_chunks, icb, jbgp.nb_ic);
@@ -966,8 +839,7 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
                 }
                 int n = (oss * jbgp.nb_os_blocking + osb) * jbgp.os_block;
                 ker(ithr_ic_mb, nthr_ic_mb, ithr_oc, nthr_oc, n, icb, occ,
-                        occ == occ_start, osb == 0 || occ_work > 1,
-                        prev_ker_idx);
+                        occ == occ_start, osb == 0 || occ_work > 1);
             }
             ++start;
             nd_iterator_step(oss, os_chunks, icb, jbgp.nb_ic);
@@ -1022,7 +894,6 @@ void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
     }
 }
 
-template struct brgemm_inner_product_bwd_data_t<avx2>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core_amx>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core_bf16>;
@@ -1080,7 +951,8 @@ struct brgemm_inner_product_bwd_weights_t<isa>::thread_info_t {
                 ? scratchpad.template get<char>(key_brgemm_primitive_buffer_b)
                 : nullptr;
 
-        thread_local_input_buffers_ = jbgp.local_buffers_for_input_tensors;
+        thread_local_input_buffers_
+                = jbgp.ip_bwd_w_local_buffers_for_input_tensors;
         int ic_chunks = utils::div_up(jbgp.nb_ic, jbgp.nb_ic_blocking);
         int os_chunks = utils::div_up(jbgp.nb_os, jbgp.nb_os_blocking);
         nb_ic_blocking_ = jbgp.nb_ic_blocking;
@@ -1396,7 +1268,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
 
     const auto ker = [&](const int osc, const int icb, const int ocb,
                              const int osc_prev, const int icc_prev,
-                             const int occ_prev, int &prev_ker_idx) {
+                             const int occ_prev) {
         brgemm_batch_element_t *addr_batch
                 = addr_batch_global + ti->ithr * jbgp.adjusted_batch_size;
         char *wsp_tile = is_amx_bf16
@@ -1426,7 +1298,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
         const bool transform_weights = jbgp.wei_dt != jbgp.acc_dt
                 && (jbgp.nthr_mb == 1 || os_chunks == 1)
                 && osc == (os_chunks - 1);
-        const bool transform_b = jbgp.local_buffers_for_input_tensors
+        const bool transform_b = jbgp.ip_bwd_w_local_buffers_for_input_tensors
                 ? jbgp.use_buffer_b && icb % jbgp.nb_ic_blocking == 0
                         && ocb % jbgp.nb_oc_blocking == 0
                         && IMPLICATION(osc_prev == osc,
@@ -1434,7 +1306,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
                 : jbgp.use_buffer_b
                         && icb == ti->ic_c_start * jbgp.nb_ic_blocking
                         && ocb % jbgp.nb_oc_blocking == 0;
-        const bool transform_a = jbgp.local_buffers_for_input_tensors
+        const bool transform_a = jbgp.ip_bwd_w_local_buffers_for_input_tensors
                 ? jbgp.use_buffer_a && ocb % jbgp.nb_oc_blocking == 0
                         && IMPLICATION(osc_prev == osc,
                                 icc_prev != icb / jbgp.nb_ic_blocking)
@@ -1446,7 +1318,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
 
         auto is_bs_tail = (nb_os_b != jbgp.nb_os_blocking);
         const int brg_ker_idx
-                = brgemm_inner_product_utils::get_brg_kernel_index(
+                = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
                         is_bs_tail, kernel_init, is_ic_tail, is_oc_tail, false);
         auto brg_kernel = brg_kernels_[brg_ker_idx].get();
 
@@ -1455,8 +1327,8 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
                     types::data_type_size(jbgp.acc_dt) * jbgp.ic_block
                             * jbgp.oc_block);
         if (nb_os_b > 0 && brg_kernel != nullptr) {
-            brgemm_palettes_.maybe_tile_configure(
-                    jbgp.is_amx, prev_ker_idx, brg_ker_idx);
+            if (jbgp.is_amx)
+                amx_tile_configure(&brg_kernel_palettes_[brg_ker_idx][0]);
             if (transform_a) {
                 const memory_desc_wrapper src_d(pd()->src_md());
                 auto src_ptr = ti->src
@@ -1510,14 +1382,6 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
         }
 
         if (is_os_tail) {
-            auto use_init_ker = (kernel_init && nb_os_b == 0);
-            const int brg_ker_idx_os_tail
-                    = brgemm_inner_product_utils::get_brg_kernel_index(
-                            false, use_init_ker, is_ic_tail, is_oc_tail, true);
-            auto brg_kernel_os_tail = brg_kernels_[brg_ker_idx_os_tail].get();
-            if (brg_kernel_os_tail != nullptr)
-                brgemm_palettes_.maybe_tile_configure(
-                        jbgp.is_amx, prev_ker_idx, brg_ker_idx_os_tail);
             int os_block = nb_os_b;
             auto a_ptr = a_buffer + os_block * a_buf_osb_shift;
 
@@ -1563,7 +1427,15 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
                 (*kernels_db_[true][is_oc_tail])(&p);
             }
 
+            auto use_init_ker = (kernel_init && nb_os_b == 0);
+            const int brg_ker_idx_os_tail
+                    = brgemm_inner_product_utils::get_brg_kernel_index(jbgp,
+                            false, use_init_ker, is_ic_tail, is_oc_tail, true);
+            auto brg_kernel_os_tail = brg_kernels_[brg_ker_idx_os_tail].get();
             if (brg_kernel_os_tail != nullptr) {
+                if (jbgp.is_amx)
+                    amx_tile_configure(
+                            &brg_kernel_palettes_[brg_ker_idx_os_tail][0]);
                 brgemm_kernel_execute(brg_kernel_os_tail, 1, addr_batch,
                         (void *)get_wei_acc_ptr(ti, ocb, icb), wsp_tile);
             }
@@ -1584,9 +1456,12 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
     const auto loop_end = occ_work * icc_work * osc_work;
 
     int occ_idx = 0, icc_idx = 0, osc_idx = 0;
+    loop_order_t loop_order = jbgp.ip_bwd_w_local_buffers_for_input_tensors
+            ? loop_order_t::osc_icc_occ
+            : jbgp.harness == harness_mb_reduction ? loop_order_t::osc_occ_icc
+                                                   : loop_order_t::occ_icc_osc;
 
-    using loop_order_t = jit_brgemm_ip_bwd_w_conf_t::loop_order_t;
-    switch (jbgp.loop_order) {
+    switch (loop_order) {
         case loop_order_t::osc_icc_occ:
             nd_iterator_init(loop_idx, osc_idx, osc_work, icc_idx, icc_work,
                     occ_idx, occ_work);
@@ -1600,7 +1475,6 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
                     osc_idx, osc_work);
     };
 
-    int prev_ker_idx = -1;
     int osc_prev = -1, icc_prev = -1, occ_prev = -1;
     while (loop_idx < loop_end) {
         const int occ = ti->oc_c_start + occ_idx;
@@ -1616,7 +1490,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
         for (int icb = 0; icb < icb_work; icb++) {
             ker(osc, icc * jbgp.nb_ic_blocking + icb,
                     occ * jbgp.nb_oc_blocking + ocb, osc_prev, icc_prev,
-                    occ_prev, prev_ker_idx);
+                    occ_prev);
         }
         osc_prev = osc;
         icc_prev = icc;
@@ -1624,7 +1498,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::compute_diff_weights_and_bias(
 
         ++loop_idx;
 
-        switch (jbgp.loop_order) {
+        switch (loop_order) {
             case loop_order_t::osc_icc_occ:
                 nd_iterator_step(osc_idx, osc_work, icc_idx, icc_work, occ_idx,
                         occ_work);
@@ -1654,10 +1528,8 @@ void brgemm_inner_product_bwd_weights_t<
     const bool is_f32_out = jbgp.wei_dt == data_type::f32;
     const int icb_scale = is_f32_out ? jbgp.ic_block / jbgp.simd_w : 1;
 
-    const int icb_work = nstl::min(ti->ic_c_work * jbgp.nb_ic_blocking,
-            jbgp.nb_ic - ti->ic_c_start * jbgp.nb_ic_blocking);
-    const int ocb_work = nstl::min(ti->oc_c_work * jbgp.nb_oc_blocking,
-            jbgp.nb_oc - ti->oc_c_start * jbgp.nb_oc_blocking);
+    const int icb_work = ti->ic_c_work * jbgp.nb_ic_blocking;
+    const int ocb_work = ti->oc_c_work * jbgp.nb_oc_blocking;
     const int work = ocb_work * icb_work;
 
     int os_chunks = utils::div_up(jbgp.nb_os, jbgp.nb_os_blocking);

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -48,6 +48,7 @@ namespace dnnl_impl {
 template <bool quantized>
 struct matmul_t : public kernel_base_t {
 private:
+    dnnl::engine p_engine_;
     allocator_t *g_alloc_;
 
     std::shared_ptr<subgraph_t> subgraph_;
@@ -59,22 +60,16 @@ private:
     constant_cache_t::key_t constant_key_
             = reinterpret_cast<constant_cache_t::key_t>(this);
 
+    bool enable_constant_cache_ = is_constant_cache_enabled();
+
 public:
-    matmul_t() {
-        thread_local_cache_t<execution_args_set_t> res_cache;
-        res_cache.retain();
-
-        if (enabled_constant_cache()) get_global_constant_cache().retain();
-    }
-
     ~matmul_t() override {
         thread_local_cache_t<execution_args_set_t> res_cache;
         res_cache.remove_if_exist(reinterpret_cast<size_t>(this));
-        res_cache.release();
 
-        if (enabled_constant_cache()) {
-            get_global_constant_cache().remove_if_exist(constant_key_);
-            get_global_constant_cache().release();
+        if (enable_constant_cache_) {
+            constant_cache_t constant_cache;
+            constant_cache.remove_if_exist(constant_key_);
         }
     }
 
@@ -86,8 +81,8 @@ public:
         g_alloc_ = reinterpret_cast<graph::allocator_t *>(
                 g_engine->get_allocator());
 
-        subgraph_ = std::make_shared<subgraph_t>(part->get_ops(), p_engine_,
-                part->get_fpmath_mode(), part->get_use_blocked_layout(), true);
+        subgraph_ = std::make_shared<subgraph_t>(
+                part->get_ops(), p_engine_, part->get_fpmath_mode(), true);
         BACKEND_DNNL_CHECK(
                 set_given_inputs_outputs(subgraph_, inputs, outputs));
 
@@ -97,9 +92,8 @@ public:
         pass_pipeline_t pipeline(vis);
 
         BACKEND_DNNL_ADD_PASS(pipeline, lower_down);
-        BACKEND_DNNL_ADD_PASS(pipeline, fuse_bias_add);
-        // check if bias exists
-        BACKEND_DNNL_ADD_PASS(pipeline, check_with_bias);
+
+        BACKEND_DNNL_ADD_PASS(pipeline, move_scalar_div_behind_matmul);
 
         if (quantized) {
             BACKEND_DNNL_ADD_PASS(pipeline, lift_up_typecast);
@@ -109,13 +103,18 @@ public:
             BACKEND_DNNL_ADD_PASS(
                     pipeline, fuse_post_typecast_to_matmul_or_conv);
             BACKEND_DNNL_ADD_PASS(pipeline, fuse_typecast_to_mul_scales);
-            BACKEND_DNNL_ADD_PASS(pipeline, convert_bias_to_f32);
         }
 
+        BACKEND_DNNL_ADD_PASS(pipeline, fuse_bias_add);
+        // check if bias exists
+        BACKEND_DNNL_ADD_PASS(pipeline, check_with_bias);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_mul_sigmoid_to_swish);
 
+        BACKEND_DNNL_ADD_PASS(pipeline, binary_canonicalization);
+        BACKEND_DNNL_ADD_PASS(pipeline, binary_broadcast_swap);
+
         if (quantized) {
-            BACKEND_DNNL_ADD_PASS(pipeline, remove_quant_data_with_no_effect);
+            BACKEND_DNNL_ADD_PASS(pipeline, convert_bias_to_f32);
             BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_scales);
             BACKEND_DNNL_ADD_PASS(pipeline, fuse_src_scales);
             BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_zero_points);
@@ -123,8 +122,7 @@ public:
             // tricky here.
             BACKEND_DNNL_ADD_PASS(pipeline, insert_runtime_u8_to_s8_for_matmul);
         }
-        BACKEND_DNNL_ADD_PASS(pipeline, binary_canonicalization);
-        BACKEND_DNNL_ADD_PASS(pipeline, binary_broadcast_swap);
+
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_post_ops);
 
         if (quantized) {
@@ -137,7 +135,6 @@ public:
             // fuse neighboring mul_scales and zdd_zps op to quantize/dequantize
             BACKEND_DNNL_ADD_PASS(pipeline, fuse_dynamic_mul_scales_add_zps);
             BACKEND_DNNL_ADD_PASS(pipeline, fuse_dynamic_sub_zps_mul_scales);
-            BACKEND_DNNL_ADD_PASS(pipeline, convert_dynamic_quantize_ops);
         }
 
         BACKEND_DNNL_ADD_PASS(pipeline, insert_u8_to_s8_for_matmul);
@@ -149,7 +146,7 @@ public:
         pipeline.reset_visualize_arg(true, false);
         // do constant propagation here so that we can
         // prepare constant info for other optimizations.
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             BACKEND_DNNL_ADD_PASS(pipeline, constant_propagation);
         }
 
@@ -161,7 +158,7 @@ public:
 
         // do constant propagation again since layout propagation may
         // insert/delete operators
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             BACKEND_DNNL_ADD_PASS(pipeline, constant_propagation);
         }
 
@@ -236,10 +233,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {
@@ -309,10 +307,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {

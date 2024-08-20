@@ -19,15 +19,12 @@
 #include <cctype>
 #include <cstring>
 
+#include "common/type_helpers.hpp"
 #include "gpu/jit/conv/block_helper.hpp"
 #include "gpu/jit/conv/config_lookup_table.hpp"
-#include "gpu/jit/conv/config_plan.hpp"
 #include "gpu/jit/conv/grf_usage.hpp"
-#include "gpu/jit/conv/message_patterns.hpp"
 #include "gpu/jit/conv/normalization.hpp"
 #include "gpu/jit/ir/block_2d_utils.hpp"
-#include "gpu/jit/ir/gemm_schedule.hpp"
-#include "gpu/jit/ir/tensor_config.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -35,6 +32,25 @@ namespace gpu {
 namespace jit {
 
 // Helper functions.
+layout_t make_layout(const memory_desc_t &md) {
+    if (md.format_kind == format_kind::any) return layout_t();
+    return layout_t(md, /*do_normalize=*/false);
+}
+
+layout_t make_layout(const memory_desc_t &md, const std::string &tag) {
+    return layout_t(md, tag, /*do_normalize=*/false);
+}
+
+layout_t make_layout(const type_t &type, const std::vector<dim_t> &dims,
+        const std::string &tag) {
+    return layout_t(type, 0, tag, dims, /*do_normalize=*/false);
+}
+
+void set_default_format(memory_desc_t &md, const std::string &tag) {
+    if (md.format_kind != format_kind::any) return;
+    md = make_layout(md, tag).to_dnnl(md.dims);
+}
+
 bool matches_tag(const layout_t &layout, const std::string &tag,
         const std::vector<dim_t> &dims) {
     if (layout.is_empty()) return false;
@@ -103,11 +119,6 @@ bool is_small_oc(const conv_problem_t &prb) {
         return prb.oc <= 8;
     else
         return prb.oc * size <= 16;
-}
-
-bool is_mad_g_small_oc(const conv_config_t &cfg) {
-    return (cfg.prb().g > 1 && cfg.prb().g < 16
-            && cfg.fma_kind() == fma_kind_t::mad && is_small_oc(cfg.prb()));
 }
 
 bool is_dw_large_mb(const conv_problem_t &prb) {
@@ -186,6 +197,7 @@ status_t conv_problem_t::init(
 
     CHECK(init_abc_data_types(hw));
     CHECK(init_acc_data_type());
+    CHECK(init_zero_points_config());
 
     return status::success;
 }
@@ -241,6 +253,23 @@ void conv_problem_t::try_reduce_to_1d() {
     }
 }
 
+status_t conv_problem_t::init_zero_points_config() {
+    zp_cfg = zero_points_config_t();
+    zp_cfg.do_src_compensation
+            = !attr->zero_points_.has_default_values(DNNL_ARG_SRC);
+    zp_cfg.do_dst_compensation
+            = !attr->zero_points_.has_default_values(DNNL_ARG_DST);
+    zp_cfg.is_runtime_src_zero_points
+            = !attr->zero_points_.defined(DNNL_ARG_SRC);
+    zp_cfg.is_runtime_dst_zero_points
+            = !attr->zero_points_.defined(DNNL_ARG_DST);
+    zp_cfg.is_common_src_zero_point = attr->zero_points_.common(DNNL_ARG_SRC);
+    zp_cfg.is_common_dst_zero_point = attr->zero_points_.common(DNNL_ARG_DST);
+    zp_cfg.common_src_zero_point = 0;
+    zp_cfg.common_dst_zero_point = 0;
+    return status::success;
+}
+
 std::string conv_problem_t::desc_str(bool print_mb) const {
     std::ostringstream oss;
     if (print_mb) oss << "mb" << mb;
@@ -253,8 +282,8 @@ std::string conv_problem_t::desc_str(bool print_mb) const {
     std::vector<int> xdef = {1, 1, 1, 1, 0, 0};
     bool has_d = !ir_utils::is_equal(xd, xdef);
     bool has_h = !ir_utils::is_equal(xh, xdef);
-    bool is_square = !has_d && ir_utils::is_equal(xh, xw);
-    bool is_cubic = ir_utils::is_equal(xd, xh) && ir_utils::is_equal(xd, xw);
+    bool is_square = ir_utils::is_equal(xh, xw);
+    bool is_cubic = is_square && ir_utils::is_equal(xd, xh);
     bool print_d = has_d;
     bool print_h = has_h && !is_cubic;
     bool print_w = !is_cubic && !is_square;
@@ -281,35 +310,11 @@ std::string conv_problem_t::desc_str(bool print_mb) const {
     return oss.str();
 }
 
-int param_t::sort_key() const {
-    static const char *ordered_params[] = {
-            "exec-cfg",
-            "fma",
-            "l",
-            "T",
-            "i",
-            "P",
-            "p",
-            "s",
-            "src",
-            "wei",
-            "dst",
-            "bia",
-            nullptr,
-    };
-    for (const char **p = ordered_params; *p; p++) {
-        if (short_name() == *p) return p - ordered_params;
-    }
-    return (int)(sizeof(ordered_params) / sizeof(ordered_params[0]));
-}
-
 int get_default_max_tg_size(const hw_config_t &hw_cfg, int regs, int simd) {
     const compute::gpu_arch_t arch = convert_ngen_arch_to_dnnl(hw_cfg.hw());
     const int max_eus_per_wg = compute::device_info_t::max_eus_per_wg(arch);
     const int threads_per_eu
             = compute::device_info_t::threads_per_eu(arch, regs > 128);
-    // When threads_per_eu is reduced by cfg (large_grf_mode) wg_per_thread
-    // is increased proportionally.
     const int wg_per_thr = simd * compute::device_info_t::threads_per_eu(arch)
             / threads_per_eu;
 
@@ -319,10 +324,13 @@ int get_default_max_tg_size(const hw_config_t &hw_cfg, int regs, int simd) {
             static_cast<int>(hw_cfg.max_wg_size() / wg_per_thr));
 }
 
-const bool check_slm_size_param_t::default_value = true;
-const bool fuse_spatial_param_t::default_value = false;
-const bool shrink_tg_dims_param_t::default_value = false;
-const bool pad_slm_param_t::default_value = true;
+std::vector<dim_t> get_prelu_weights_dims(
+        uint32_t mask, const memory_desc_t &md) {
+    std::vector<dim_t> dims(md.dims, md.dims + md.ndims);
+    for (int i = 0; i < md.ndims; ++i)
+        dims[i] = (mask & (1 << i)) ? dims[i] : 1;
+    return dims;
+}
 
 std::string build_tag(const std::vector<int> &inner_blocks,
         const std::vector<int> &outer_blocks, const std::vector<char> &letters,
@@ -407,7 +415,7 @@ struct nc_block_t {
     static nc_block_t get_default_blocking(type_t type, bool is_dw, int n,
             int c, int g, bool is_input, bool is_small_c,
             int min_block_size = 0, bool nc_order = true,
-            bool channel_match = false, bool force_default_c_blk = false) {
+            bool force_default_c_blk = false) {
         bool is_small_c_input
                 = (type.size() <= 2 && is_input && g == 1 && is_small_c);
         auto default_c_blk = type.size() == 1 ? 32 : 16;
@@ -415,7 +423,6 @@ struct nc_block_t {
             if (force_default_c_blk) return default_c_blk;
             // Special case for small input channel shapes with dpas.
             if (is_small_c_input) {
-                if (c == 1 && n == 1 && channel_match) return 0;
                 int packed_dword_elems = 4 / type.size();
                 return std::max(packed_dword_elems, utils::rnd_up_pow2(c));
             }
@@ -655,17 +662,15 @@ void init_data_tags(const conv_config_t &cfg, bool allow_src_reorder,
             && allow_src_reorder && prb.mb >= 16;
     int min_block_size = is_bwd_w_message_opt ? 128 : 0;
     bool nc_order = is_bwd_w_message_opt ? false : true;
-    bool channel_match = prb.ic == prb.oc;
 
     nc_block_t src_blk = nc_block_t::get_default_blocking(src_compute_type,
             prb.is_dw, prb.mb, prb.ic, prb.g, prb.is_fwd || prb.is_bwd_w,
-            is_small_ic(prb), min_block_size, nc_order, channel_match);
+            is_small_ic(prb), min_block_size, nc_order);
     // TODO: Force use of default_c_blk for bwd_w with bias due to reduction
     // limitation to register granularity
     nc_block_t dst_blk = nc_block_t::get_default_blocking(dst_compute_type,
             prb.is_dw, prb.mb, prb.oc, prb.g, prb.is_bwd_d || prb.is_bwd_w,
-            is_small_oc(prb), 0, true, channel_match,
-            prb.is_bwd_w && prb.with_bias && prb.g == 1);
+            is_small_oc(prb), 0, true, prb.is_bwd_w && prb.with_bias);
 
     auto wei_blk = goi_block_t::get_default_blocking(wei_compute_type,
             cfg.vec_size(), cfg.fma_kind(), prb.is_bwd_d, is_small_ic(prb),
@@ -727,8 +732,7 @@ void init_data_tags(const conv_config_t &cfg, bool allow_src_reorder,
     if (prb.is_bwd_d && src_axb) src_tag = "axb";
 }
 
-status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
-        memory_desc_t &wei_md, memory_desc_t &bia_md, memory_desc_t &dst_md) {
+status_t init_tensor_layouts(conv_config_t &cfg, convolution_pd_t *pd) {
     const auto &prb = cfg.prb();
     // Compute layout tags and user layout tags. If a compute layout is
     // different from a user layout then an extra pre/post reorder will be
@@ -736,6 +740,11 @@ status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
     std::string src_tag, user_src_tag;
     std::string wei_tag, user_wei_tag;
     std::string dst_tag, user_dst_tag;
+
+    auto &src_md = *pd->invariant_src_md();
+    auto &wei_md = *pd->invariant_wei_md();
+    auto &dst_md = *pd->invariant_dst_md();
+    auto &bia_md = *pd->invariant_bia_md();
 
     // If src/dst is nhwc then set the other one with any to nhwc too (except
     // 1st convolution).
@@ -780,14 +789,9 @@ status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
     }
 
     // Allow internal reorder for plain weights.
-    std::vector<const char *> plain_non_group_wei_tags = {"abx", "axb", "xba"};
-    std::vector<const char *> plain_group_wei_tags = {"abcx", "abxc", "axcb"};
-    auto &plain_wei_tags = (prb.with_groups ? plain_group_wei_tags
-                                            : plain_non_group_wei_tags);
-    ir_assert(plain_non_group_wei_tags.size() == plain_group_wei_tags.size());
-    for (size_t i = 0; i < plain_wei_tags.size(); i++) {
-        if (matches_tag(wei_md, plain_wei_tags[i])) {
-            user_wei_tag = plain_non_group_wei_tags[i];
+    for (auto *t : {"abx", "axb"}) {
+        if (matches_tag(wei_md, t)) {
+            user_wei_tag = t;
             break;
         }
     }
@@ -800,23 +804,6 @@ status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
     if (wei_prepend_groups) {
         wei_tag = prepend_groups_to_tag(wei_tag);
         user_wei_tag = prepend_groups_to_tag(user_wei_tag);
-    }
-
-    auto &src = cfg.src_layout();
-    auto &wei = cfg.wei_layout();
-    auto &dst = cfg.dst_layout();
-    auto &bia = cfg.bia_layout();
-    if (src.is_overridden()) {
-        src_tag = src.compute_unnormalized_tag();
-        user_src_tag = src.user_unnormalized_tag();
-    }
-    if (wei.is_overridden()) {
-        wei_tag = wei.compute_unnormalized_tag();
-        user_wei_tag = wei.user_unnormalized_tag();
-    }
-    if (dst.is_overridden()) {
-        dst_tag = dst.compute_unnormalized_tag();
-        user_dst_tag = dst.user_unnormalized_tag();
     }
 
     // Select user layouts.
@@ -849,14 +836,19 @@ status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
             bia_layout = bia_layout.retype(type_t::f32());
     }
 
-    src.set_compute_unnormalized(src_layout, src_tag);
-    src.set_user_unnormalized(user_src_layout, user_src_tag);
-    wei.set_compute_unnormalized(wei_layout, wei_tag);
-    wei.set_user_unnormalized(user_wei_layout, user_wei_tag);
-    dst.set_compute_unnormalized(dst_layout, dst_tag);
-    dst.set_user_unnormalized(user_dst_layout, user_dst_tag);
-    bia.set_compute_unnormalized(bia_layout, "a");
-    bia.set_user_unnormalized(user_bia_layout, "a");
+    auto &src = cfg.src_layout();
+    auto &wei = cfg.wei_layout();
+    auto &dst = cfg.dst_layout();
+    auto &bia = cfg.bia_layout();
+
+    src.set_compute_unnormalized(src_layout);
+    src.set_user_unnormalized(user_src_layout);
+    wei.set_compute_unnormalized(wei_layout);
+    wei.set_user_unnormalized(user_wei_layout);
+    dst.set_compute_unnormalized(dst_layout);
+    dst.set_user_unnormalized(user_dst_layout);
+    bia.set_compute_unnormalized(bia_layout);
+    bia.set_user_unnormalized(user_bia_layout);
 
     // Normalize layouts: add group dimension for all layouts and reduce/fuse
     // spatial dimensions when applicable.
@@ -883,7 +875,9 @@ status_t init_tensor_layouts(conv_config_t &cfg, memory_desc_t &src_md,
 }
 
 bool hw_ok(const hw_config_t &hw_cfg) {
-    if (hw_cfg.hw() < ngen::HW::Gen9) return false;
+    // Disable pre-XeHP until performance parity is reached with OpenCL
+    // kernels.
+    if (hw_cfg.hw() < ngen::HW::XeHP) return false;
     return true;
 }
 
@@ -920,14 +914,18 @@ bool zero_points_ok(const conv_problem_t &prb) {
     auto *pd = prb.conv_pd;
     auto *attr = pd->attr();
 
+    // TODO: implement the rest of the cases and remove this 'if'
+    bool ic_kdhw
+            = (prb.ic <= 8) && (prb.kd * prb.kh * prb.kw > 1) && !prb.is_dw;
+    if (!attr->zero_points_.has_default_values(DNNL_ARG_SRC) && ic_kdhw)
+        return false;
+
     using namespace data_type;
     const auto input_type = (prb.is_fwd) ? pd->invariant_src_md()->data_type
                                          : pd->invariant_dst_md()->data_type;
     int mask_src = 0, mask_dst = 0;
-    if (attr->zero_points_.get(DNNL_ARG_SRC, &mask_src) != status::success)
-        return false;
-    if (attr->zero_points_.get(DNNL_ARG_DST, &mask_dst) != status::success)
-        return false;
+    attr->zero_points_.get(DNNL_ARG_SRC, &mask_src);
+    attr->zero_points_.get(DNNL_ARG_DST, &mask_dst);
 
     return IMPLICATION(!utils::one_of(input_type, s8, u8),
                    attr->zero_points_.has_default_values())
@@ -936,8 +934,13 @@ bool zero_points_ok(const conv_problem_t &prb) {
             && (mask_dst == 0 || mask_dst == 1 << 1);
 }
 
+std::vector<int> get_scale_args(const conv_problem_t &prb) {
+    conv_arg_helper_t h(prb);
+    std::vector<int> ret = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
+    return ret;
+}
+
 bool post_ops_ok(const conv_problem_t &prb, const hw_config_t &hw_cfg) {
-    auto *pd = prb.conv_pd;
     auto *attr = prb.attr;
 
     // No post-ops are supported for f64
@@ -952,21 +955,11 @@ bool post_ops_ok(const conv_problem_t &prb, const hw_config_t &hw_cfg) {
         if (!attr->has_default_values()) return false;
     }
 
-    using namespace data_type;
-    const auto input_type = (prb.is_fwd) ? pd->invariant_src_md()->data_type
-                                         : pd->invariant_dst_md()->data_type;
-    if (!attr->post_ops_.check_sum_consistency(
-                prb.c_data_type, utils::one_of(input_type, s8, u8), true))
-        return false;
-
     if (!attr->scales_.has_default_values())
         if (!prb.is_s32_accumulator()) return false;
-    auto scale_args = get_scale_args();
-    std::vector<int> scales(scale_args.size());
-    for (int i = 0; i < (int)scale_args.size(); i++)
-        scales[i] = scale_args[i].second;
-    if (!attr->scales_.has_default_values(scales)) return false;
-    for (int arg : scales) {
+    auto scale_args = get_scale_args(prb);
+    if (!attr->scales_.has_default_values(scale_args)) return false;
+    for (int arg : scale_args) {
         int mask = attr->scales_.get(arg).mask_;
         // XXX: per_oc for BWD_D is treated as per_ic assuming it's called from
         // deconvolution.
@@ -994,19 +987,24 @@ bool post_ops_ok(const conv_problem_t &prb, const hw_config_t &hw_cfg) {
     return true;
 }
 
+const memory_desc_t *output_md(const convolution_pd_t *pd) {
+    if (pd->is_fwd()) return pd->dst_md();
+    if (pd->is_bwd_d()) return pd->diff_src_md();
+    if (pd->is_bwd_w()) return pd->diff_weights_md();
+    ir_error_not_expected();
+    return nullptr;
+}
+
 void maybe_override_from_lookup_table(conv_config_t &cfg) {
-#ifdef GEN_CONV_DEBUG
-    if (!ir_utils::getenv_bool("lookup", true)) return;
-#endif
     static conv_config_lookup_table_t table;
     auto *s_params = table.find(cfg);
-    if (s_params) cfg.override_set(s_params, /*is_env=*/false);
+    if (s_params) cfg.override_set(s_params);
 }
 
 void maybe_override_from_env(conv_config_t &cfg) {
     auto cfg_env = ir_utils::getenv_str("cfg", "");
     if (cfg_env.empty()) return;
-    cfg.override_set(cfg_env, /*is_env=*/true);
+    cfg.override_set(cfg_env.c_str());
 }
 
 void maybe_override(conv_config_t &cfg) {
@@ -1017,12 +1015,11 @@ void maybe_override(conv_config_t &cfg) {
 }
 
 status_t init_fma_kind(conv_config_t &cfg) {
-    if (cfg.fma_kind_param().is_overridden()) return status::success;
     const auto &prb = cfg.prb();
     auto fma_kind = fma_kind::get_supported_kind(
             cfg.hw(), prb.a_data_type, prb.b_data_type, prb.acc_data_type);
     // Force mad for some cases.
-    if (prb.is_dw || (prb.ic < 3 && prb.oc < 3 && prb.mb < 8))
+    if (prb.is_dw || (prb.g > 1 && prb.ic < 4 && prb.oc < 4 && prb.mb < 8))
         fma_kind = fma_kind_t::mad;
     if (fma_kind == fma_kind_t::unknown) return status::unimplemented;
     cfg.set_fma_kind(fma_kind);
@@ -1040,17 +1037,13 @@ status_t init_simd(conv_config_t &cfg) {
 }
 
 status_t init_vec_size(conv_config_t &cfg) {
-    if (cfg.exec_cfg_param().is_overridden("vec")) return status::success;
-
     const auto &prb = cfg.prb();
     int vec_size = cfg.simd();
     if (cfg.fma_kind() == fma_kind_t::mad) {
         int grf_elems = cfg.grf_size() / prb.acc_data_type_size;
         int vec_dim = (prb.is_fwd || prb.is_bwd_w) ? prb.oc : prb.ic;
-        if (utils::rnd_up(vec_dim, grf_elems) < vec_size) vec_size = grf_elems;
+        if (vec_size > grf_elems && vec_dim <= 8) vec_size = grf_elems;
     }
-    // SIMD32 produces invalid layouts in bwd_w.
-    if (prb.is_bwd_w) vec_size = std::min(vec_size, 16);
     cfg.set_vec_size(vec_size);
     return status::success;
 }
@@ -1086,9 +1079,7 @@ bool post_op_layouts_ok(const conv_problem_t &prb) {
 }
 
 status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
-        const engine_t *engine, convolution_pd_t *pd, memory_desc_t &src_md,
-        memory_desc_t &wei_md, memory_desc_t &bia_md, memory_desc_t &dst_md,
-        primitive_attr_t *attr) {
+        const engine_t *engine, convolution_pd_t *pd, primitive_attr_t *attr) {
     hw_config_t hw_cfg(engine);
 
     if (!hw_ok(hw_cfg)) return status::unimplemented;
@@ -1096,8 +1087,6 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
     if (!post_ops_ok(prb, hw_cfg)) return status::unimplemented;
     if (!zero_points_ok(prb)) return status::unimplemented;
 
-    zero_points_config_t zp_cfg(pd);
-    cfg.set_zp_cfg(zp_cfg);
     cfg.set_prb(prb);
     cfg.set_exec_cfg(exec_config_t(hw_cfg));
 
@@ -1106,7 +1095,7 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
     CHECK(init_fma_kind(cfg));
     CHECK(init_simd(cfg));
     CHECK(init_vec_size(cfg));
-    CHECK(init_tensor_layouts(cfg, src_md, wei_md, bia_md, dst_md));
+    CHECK(init_tensor_layouts(cfg, pd));
 
     CHECK(attr->set_default_formats(&prb.c_md()));
 
@@ -1133,8 +1122,9 @@ void init_pipeline(conv_config_t &cfg) {
     const auto &prb = cfg.prb();
     bool do_unroll = true;
     if (prb.is_fwd) {
-        const int max_unroll = cfg.hw() <= ngen::HW::XeLP ? 4 : 9;
+        const int max_unroll = 9;
         if (prb.ksp > max_unroll) do_unroll = false;
+        if (is_small_ic(prb)) do_unroll = false;
     } else if (prb.is_bwd_d) {
         // Do not perform full unrolling when there are too many inner
         // iterations.
@@ -1155,7 +1145,7 @@ void init_pipeline(conv_config_t &cfg) {
     if (utils::one_of(cfg.fma_kind(), fma_kind_t::mad, fma_kind_t::dp4a)
             && (cfg.hw() >= ngen::HW::XeHPG || prb.mb != 1))
         do_unroll = false;
-    cfg.pipeline().set(do_unroll, /*reuse_headers=*/false);
+    cfg.pipeline().set(do_unroll);
 }
 
 void init_send_2d_nhwc(conv_config_t &cfg) {
@@ -1318,22 +1308,17 @@ void init_common_blocking(conv_config_t &cfg, block_helper_t &bh) {
         }
     } else if (prb.is_bwd_d) {
         bh.set_base_iter_block("mb", dst_layout.inner_block(0));
+        int dst_g_blk = dst_layout.inner_block(1);
+        int wei_g_blk = wei_layout.inner_block(0);
+        bh.set_base_iter_block("g", dst_g_blk, wei_g_blk);
         int dst_oc_blk = dst_layout.inner_block(2);
         int wei_oc_blk = wei_layout.inner_block(1);
         bh.set_base_iter_block("oc", dst_oc_blk, wei_oc_blk);
-        if (!prb.is_dw && !cfg.is_dp_fma()) {
-            int dst_g_blk = dst_layout.inner_block(1);
-            int wei_g_blk = wei_layout.inner_block(0);
-            bh.set_base_iter_block("g", dst_g_blk, wei_g_blk);
-            bh.dim("g").set_iter_dim(bh.dim("g").base_iter_block());
-        }
     } else if (prb.is_bwd_w) {
         bh.set_base_iter_block("g", wei_layout.inner_block(0));
-        int wei_oc_blk = wei_layout.inner_block(1);
+        int wei_oc_blk = wei_layout.inner_block(2);
         int dst_oc_blk = dst_layout.inner_block(2);
-        if (!is_mad_g_small_oc(cfg)) {
-            bh.set_base_iter_block("oc", wei_oc_blk, dst_oc_blk);
-        }
+        bh.set_base_iter_block("oc", wei_oc_blk, dst_oc_blk);
         int src_ic_blk = src_layout.inner_block(2);
         int wei_ic_blk = wei_layout.inner_block(2);
         bh.set_base_iter_block("ic", src_ic_blk, wei_ic_blk);
@@ -1356,77 +1341,24 @@ bool should_use_spatial_blocking(const conv_config_t &cfg,
     return sp_ratio >= mb_ratio;
 }
 
-send_pattern_t validate_blocking(const conv_config_t &cfg,
-        const block_helper_t &bh, conv_stride_layout_t::input_tensor_t tensor,
-        std::pair<const char *, const char *> translation = {"", ""}) {
-
-    const compute::gpu_arch_t arch
-            = convert_ngen_arch_to_dnnl(cfg.hw_cfg().hw());
-
-    auto is_match = [&](const block_hint_t<conv_dim_t> &hint,
-                            const block_helper_t &bh) {
-        for (auto dim : conv_dim_t::dims()) {
-            if (hint[dim]) {
-                if (dim.str() == translation.first) {
-                    if (bh.iter_dim(translation.second) % hint[dim])
-                        return false;
-                } else {
-                    if (bh.iter_dim(dim.str()) % hint[dim]) return false;
-                }
-            }
-        }
-        return true;
-    };
-
-    for (const auto &load : get_uniform_blocked_patterns(arch)) {
-        uniform_blocked_idiom_t<conv_dim_t> idiom(load);
-        auto layout = conv_stride_layout_t(cfg.prb(), tensor);
-        auto hints = idiom.get_hints(layout);
-
-        if (hints.empty()) continue;
-
-        bool found_match = false;
-        for (const auto &hint : hints) {
-            if (is_match(hint, bh)) {
-                found_match = true;
-                break;
-            }
-        }
-        if (!found_match) {
-            ir_suggestion()
-                    << "blocking disables " << load.str() << " load of the "
-                    << tensor << " tensor. Try a multiple of:\n";
-            for (auto &hint : hints) {
-                ir_suggestion() << "\t" << hint.str() << "\n";
-            }
-            return send_pattern_t();
-        }
-        return load;
-    }
-    return send_pattern_t();
-}
-
 void init_fwd(conv_config_t &cfg, block_helper_t &bh) {
     using namespace ir_utils;
 
     const auto &prb = cfg.prb();
     const char *osp_name = cfg.fuse_spatial() ? "osp" : "ow";
-    bool is_xe_lp = cfg.hw() <= ngen::HW::XeLP;
 
     //set iter block for cases with no m block and large spatial
     if (!cfg.is_ge_xe_hpc() && cfg.src_layout().compute().inner_block(0) == 1
             && prb.mb > 1 && (prb.oh == prb.ow && prb.ow == prb.od)
-            && prb.osp >= 512 && !cfg.is_g_mad()) {
-        bh.set_base_iter_block(osp_name, is_xe_lp ? 8 : 16);
+            && prb.osp >= 512) {
+        bh.set_base_iter_block(osp_name, 16);
     }
-
-    if (prb.oc == 1 && prb.ic == 1) { bh.set_expand_m_block_hint(); }
 
     if (cfg.ow_kw_grf_cache()) {
         bh.set_base_iter_block("mb", 1);
         bh.dim("mb").set_iter_dim(1);
         bh.set_max_iter_dim("mb", 1);
-        if (!is_xe_lp) bh.set_max_m_tg_dim(2);
+        bh.set_max_m_tg_dim(2);
         bh.set_max_n_tg_dim(2);
     }
     if (cfg.is_g_mad()) {
@@ -1454,19 +1386,10 @@ void init_fwd(conv_config_t &cfg, block_helper_t &bh) {
     bh.allow_fuse({"ic", "kw"});
     bh.allow_split({"oc", "ic", "kw"});
 
-    //scattered send messages use too much GRF for XeLP
-    if (is_xe_lp && prb.is_dw && prb.g < 32) bh.set_base_iter_block("g", 16);
-    if (cfg.is_broadcast_oc()) {
-        int blk = utils::rnd_up_pow2(prb.oc);
-        bh.set_base_iter_block("oc", blk);
-        bh.dim("oc").set_iter_dim(blk);
-    }
     int mb_base_iter_blk = bh.dim("mb").base_iter_block();
     // mb blocking is always outer so we can safely use a smaller divisor to
     // have more flexible blocking for some cases.
-    int mb_base_iter_divisor = is_dw_large_mb(prb) && !is_xe_lp ? 32
-            : cfg.hw() < ngen::HW::XeLP                         ? 2
-                                                                : 8;
+    int mb_base_iter_divisor = is_dw_large_mb(prb) ? 32 : 8;
     mb_base_iter_blk = math::gcd(mb_base_iter_divisor, mb_base_iter_blk);
 
     bh.set_base_iter_block("mb", mb_base_iter_blk);
@@ -1489,9 +1412,7 @@ void init_fwd(conv_config_t &cfg, block_helper_t &bh) {
         bh.reorder({osp_name, "mb"});
         if (!prb.is_int8_dst() && !cfg.fuse_spatial() && prb.mb < 16
                 && prb.iw % 8 != 0 && !prb.is_dw) {
-            int max_dim = (prb.ic < 3 && prb.oc < 3) ? 2 : 1;
-            if (!is_xe_lp) bh.set_max_m_tg_dim(max_dim);
-            if (is_xe_lp) bh.set_max_n_tg_dim(8);
+            bh.set_max_m_tg_dim(1);
         }
     } else {
         const int large_sp_threshold = cfg.is_ge_xe_hpc() ? 128 : 256;
@@ -1504,18 +1425,10 @@ void init_fwd(conv_config_t &cfg, block_helper_t &bh) {
         if (!cfg.send_2d_nhwc() && prb.mb >= 128
                 && (spatial_dim % 4 != 0 || spatial_dim < 64))
             bh.allow_split({"mb"});
-        if (bh.expand_m_block_hint()) {
-            // allow splitting for m tg dim
-            bh.allow_split({osp_name, "mb"});
-            // allow fusing for m iter dim
-            bh.allow_fuse({osp_name, "mb"});
-        }
     }
 
-    if (!is_xe_lp && prb.mb < 8 && !bh.any_pref_tg_block())
+    if (prb.mb < 8 && !bh.any_pref_tg_block())
         bh.set_pref_tg_block(prb.ow > prb.oc ? osp_name : "oc");
-    if (is_xe_lp && prb.oc < 8 && prb.ow > prb.oc)
-        bh.set_pref_tg_block(osp_name);
 
     bh.reorder({"ic", "kw"});
 
@@ -1526,16 +1439,6 @@ void init_fwd(conv_config_t &cfg, block_helper_t &bh) {
     }
 
     bh.compute();
-#ifdef GEN_CONV_DEBUG
-    if (!can_use_2d_send(cfg, cfg.a_layout().compute_unnormalized(), true)
-            && prb.g == 1)
-        cfg.a_load_pattern = validate_blocking(cfg, bh,
-                conv_stride_layout_t::input_tensor_t::src, {"ow", osp_name});
-    if (!can_use_2d_send(cfg, cfg.b_layout().compute_unnormalized(), false)
-            && prb.g == 1)
-        cfg.b_load_pattern = validate_blocking(
-                cfg, bh, conv_stride_layout_t::input_tensor_t::wei);
-#endif
 }
 
 void init_bwd_d(conv_config_t &cfg, block_helper_t &bh) {
@@ -1563,7 +1466,7 @@ void init_bwd_d(conv_config_t &cfg, block_helper_t &bh) {
         bh.reorder({"iw", "mb"});
     } else {
         bh.reorder({"mb", "iw"});
-        bh.set_base_iter_block("mb", cfg.hw() < ngen::HW::XeLP ? 4 : 8);
+        bh.set_base_iter_block("mb", 8);
     }
 
     if (cfg.send_2d_nhwc()) {
@@ -1573,13 +1476,6 @@ void init_bwd_d(conv_config_t &cfg, block_helper_t &bh) {
     }
 
     bh.compute();
-
-#ifdef GEN_CONV_DEBUG
-    if (!can_use_2d_send(cfg, cfg.a_layout().compute_unnormalized(), true))
-        validate_blocking(cfg, bh, conv_stride_layout_t::input_tensor_t::dst);
-    if (!can_use_2d_send(cfg, cfg.b_layout().compute_unnormalized(), false))
-        validate_blocking(cfg, bh, conv_stride_layout_t::input_tensor_t::wei);
-#endif
 }
 
 void init_bwd_w(conv_config_t &cfg, block_helper_t &bh) {
@@ -1587,26 +1483,12 @@ void init_bwd_w(conv_config_t &cfg, block_helper_t &bh) {
     bh.allow_k_grid_slicing();
 
     bh.set_block_dims({"g", "oc", "ic", "mb", "oh", "ow"});
-    bool vectorize_g = is_mad_g_small_oc(cfg) || prb.is_dw;
-    bh.set_vector_dim(vectorize_g ? "g" : "oc");
+    bh.set_vector_dim(prb.is_dw ? "g" : "oc");
 
-    bool is_xe_lp = cfg.hw() <= ngen::HW::XeLP;
-    int size = (int)types::data_type_size(prb.src_data_type);
-    if (size >= 4) {
-        if (is_xe_lp && size > 4) {
-            if (vectorize_g)
-                bh.set_base_iter_block("g", 8);
-            else
-                bh.set_base_iter_block("ic", 4);
-        }
-        if (prb.oc <= 32) bh.set_max_iter_dim("oc", 16);
-        if (prb.ic <= 32) bh.set_max_iter_dim("ic", 16);
-    } else {
-        if (prb.oc < 32) bh.set_max_iter_dim("oc", 16);
-        if (prb.ic < 32) bh.set_max_iter_dim("ic", 16);
-    }
+    if (prb.oc <= 32) bh.set_max_iter_dim("oc", 16);
+    if (prb.ic <= 32) bh.set_max_iter_dim("ic", 16);
 
-    if (is_small_ic(prb) && !vectorize_g) {
+    if (is_small_ic(prb) && !prb.is_dw) {
         bh.set_block_dims({"kw"});
         bh.set_max_tg_dim("kw", 1);
         bh.set_max_iter_dim("kw", 8);
@@ -1627,18 +1509,12 @@ void init_bwd_w(conv_config_t &cfg, block_helper_t &bh) {
     bh.allow_fuse({"mb", "oh", "ow"});
     bh.set_max_loop_dim("mb", 2);
     bh.set_base_iter_block("mb", math::gcd(16, bh.dim("mb").base_iter_block()));
-    if (is_xe_lp) bh.set_base_iter_block("mb", std::min(16, prb.mb));
+
     bh.reorder({"mb", "ow", "oh"});
 
     if (cfg.send_2d_nhwc()) bh.set_reduce_m_block_hint(false);
 
     bh.compute();
-#ifdef GEN_CONV_DEBUG
-    if (!can_use_2d_send(cfg, cfg.a_layout().compute_unnormalized(), true))
-        validate_blocking(cfg, bh, conv_stride_layout_t::input_tensor_t::src);
-    if (!can_use_2d_send(cfg, cfg.b_layout().compute_unnormalized(), false))
-        validate_blocking(cfg, bh, conv_stride_layout_t::input_tensor_t::dst);
-#endif
 }
 
 void init_blocking(conv_config_t &cfg) {
@@ -1784,12 +1660,7 @@ void init_thread_group_grid(conv_config_t &cfg) {
 void init_bwd_d_optimize_strided(conv_config_t &cfg) {
     const auto &prb = cfg.prb();
     if (!prb.is_bwd_d) return;
-    if (prb.is_stride1()) {
-        if (cfg.loop_dim("kw") != 1 && cfg.thread_group_dim("iw") == 1
-                && cfg.iter_dim("iw") == 1)
-            cfg.set_bwd_d_optimize_unstrided(true);
-        return;
-    }
+    if (prb.is_stride1()) return;
 
     cfg.set_bwd_d_optimize_strided(true);
 
@@ -1854,12 +1725,31 @@ void init_slm(conv_config_t &cfg) {
     if (cfg.slm().is_overridden()) return;
 
     const auto &prb = cfg.prb();
+    if (cfg.hw() >= ngen::HW::XeHPC) return;
 
     int bufs = 0;
     int gmem_bufs = 0;
-    bool enable_a = cfg.plan().slm.has_a();
-    bool enable_b = cfg.plan().slm.has_b();
+    bool enable_a = false;
+    bool enable_b = false;
     auto &tg = cfg.thread_group_grid();
+    int tg_size = tg.elems();
+    bmnk_dim_helper_t h(cfg);
+    int m_tg_blk = h.thread_group_dim('m') * h.iter_dim('m');
+    int n_tg_blk = h.thread_group_dim('n') * h.iter_dim('n');
+    int k_iter_blk = h.iter_dim('k');
+    if (!cfg.ow_kw_grf_cache()) {
+        //Check that SLM can be stored with oword messages.
+        int tg_size = tg.elems();
+        int bytes_per_tg = (m_tg_blk * k_iter_blk * prb.a_data_type_size);
+        int align = prb.is_bwd_w ? 32 : 16;
+        bool can_split_a = bytes_per_tg % align == 0
+                && bytes_per_tg / tg_size >= k_iter_blk && k_iter_blk % 2 == 0;
+        enable_a = (tg.dim(0) > 1) && can_split_a;
+    }
+    bool can_split_b = can_split_across_thread_group(
+            tg_size, n_tg_blk * k_iter_blk, prb.b_data_type_size);
+    enable_b = (tg.dim(1) > 1) && can_split_b;
+
     if (enable_a || enable_b) {
         bool is_small_tg = (tg.dim(0) * tg.dim(1) <= 8);
         int pref_bufs
@@ -1870,37 +1760,142 @@ void init_slm(conv_config_t &cfg) {
         } else {
             // Double/triple SLM buffering is not supported when only one
             // matrix is SLM-buffered.
-            // Limit the SLM buffer count to 1 in the presence of ZP, since
-            // for now the masks are otherwise computed for next iterations.
-            const bool use_pref_bufs = (enable_a == enable_b)
-                    && (!cfg.zp_cfg().do_src_compensation);
-            bufs = (use_pref_bufs ? pref_bufs : 1);
+            bufs = (enable_a == enable_b ? pref_bufs : 1);
             gmem_bufs = 1;
         }
     }
-    gmem_bufs = std::min(cfg.plan().max_gmem_bufs, gmem_bufs);
     cfg.slm().set(bufs, gmem_bufs, enable_a, enable_b);
 }
 
 void init_prefetch(conv_config_t &cfg) {
     if (cfg.prefetch().is_overridden()) return;
 
-    bool enable_a = cfg.plan().prefetch.has_a();
-    bool enable_b = cfg.plan().prefetch.has_b();
+    const auto &prb = cfg.prb();
+    if (cfg.hw() < ngen::HW::XeHPC) return;
 
-    if (!enable_a && !enable_b) return;
+    auto &tg = cfg.thread_group_grid();
+    int tg_size = tg.elems();
+    bmnk_dim_helper_t h(cfg);
+    int m_tg_blk = h.thread_group_dim('m') * h.iter_dim('m');
+    int n_tg_blk = h.thread_group_dim('n') * h.iter_dim('n');
+    int k_iter_blk = h.iter_dim('k');
+    bool can_split_a = (tg.dim(0) == 1)
+            || can_split_across_thread_group(
+                    tg_size, m_tg_blk * k_iter_blk, prb.a_data_type_size);
+    bool can_split_b = (tg.dim(1) == 1)
+            || can_split_across_thread_group(
+                    tg_size, n_tg_blk * k_iter_blk, prb.b_data_type_size);
 
-    int bufs = cfg.prb().is_f32_conv() ? 2 : 3;
-    cfg.prefetch().set(bufs, enable_a, enable_b);
+    bool use_prefetch = (can_split_a && can_split_b);
+    if (!use_prefetch) return;
+
+    cfg.prefetch().set(prb.is_f32_conv() ? 2 : 3);
 }
 
-void init_subtiles(conv_config_t &cfg) {
-    int a = 1;
-    int b = 1;
-    auto &p = cfg.plan();
-    if (p.split_abc == abc_kind_t::a) a = p.split_factor;
-    if (p.split_abc == abc_kind_t::b) b = p.split_factor;
-    cfg.subtiles().set(a, b);
+void init_allow_grf_reorder(conv_config_t &cfg) {
+    const auto &prb = cfg.prb();
+    cfg.set_allow_a_grf_reorder(!prb.matches_user_types());
+    cfg.set_allow_b_grf_reorder(!prb.matches_user_types());
+
+    bool is_mad = !cfg.is_dp_fma();
+    if (is_mad && prb.is_s32_accumulator()) {
+        cfg.set_allow_a_grf_reorder(true);
+        cfg.set_allow_b_grf_reorder(true);
+        return;
+    }
+
+    if (is_mad && prb.b_data_type == data_type::bf16) {
+        cfg.set_allow_b_grf_reorder(true);
+        return;
+    }
+
+    bool use_a_2d_send = can_use_a_2d_send(cfg);
+    bool use_b_2d_send = can_use_b_2d_send(cfg);
+    bool is_a_grf_blocked
+            = (cfg.a_layout().compute().innermost_block_layout().size()
+                            % cfg.grf_size()
+                    == 0);
+    if ((prb.is_fwd || prb.is_bwd_d) && !use_a_2d_send && !is_a_grf_blocked) {
+        const char *dim_name = (prb.is_fwd ? "ic" : "oc");
+        int dim = (prb.is_fwd ? prb.ic : prb.oc);
+        int blk = cfg.iter_dim(dim_name);
+        if (blk * prb.a_data_type_size % cfg.grf_size() != 0
+                || dim != cfg.padded_dim(dim_name)) {
+            cfg.set_allow_a_grf_reorder(true);
+        }
+    }
+    if (cfg.send_2d_nhwc() && (!prb.is_fwd)) cfg.set_allow_a_grf_reorder(true);
+
+    bool a_is_small_c = (prb.is_fwd || prb.is_bwd_w) ? is_small_ic(prb)
+                                                     : is_small_oc(prb);
+    if (cfg.is_dp_fma() && !prb.is_dw && a_is_small_c) {
+        cfg.set_allow_a_grf_reorder(true);
+    }
+
+    if (prb.is_bwd_w && cfg.is_dp_fma()) {
+        cfg.set_allow_a_grf_reorder(true);
+        if (!use_b_2d_send) cfg.set_allow_b_grf_reorder(true);
+    }
+}
+
+void init_allow_slm_tg_slicing(conv_config_t &cfg) {
+    const auto &prb = cfg.prb();
+    if (!prb.is_bwd_w) return;
+    if (!utils::everyone_is(prb.a_data_type, prb.b_data_type, data_type::bf16))
+        return;
+    if (!cfg.is_dp_fma()) return;
+
+    // Enable only for layouts with batch blocking.
+    int src_mb_blk = cfg.src_layout().compute().inner_block(0);
+    int src_ic_blk = cfg.src_layout().compute().inner_block(2);
+    int dst_mb_blk = cfg.dst_layout().compute().inner_block(0);
+    int dst_oc_blk = cfg.dst_layout().compute().inner_block(2);
+    if (src_mb_blk < 16 || dst_mb_blk < 16) return;
+
+    bmnk_dim_helper_t h(cfg);
+    int k_iter_blk = h.iter_dim('k');
+    int m_iter_blk = h.iter_dim('m');
+    int n_iter_blk = h.iter_dim('n');
+    int m_tg_dim = h.thread_group_dim('m');
+    int n_tg_dim = h.thread_group_dim('n');
+    int tg_size = m_tg_dim * n_tg_dim;
+
+    // Backward by weights with dpas layouts requires GRF reorders for A/B
+    // (e.g. 2c*16n16c -> 32c16n). When SLM is used, such reorders are
+    // generated after load from GMEM and before store to SLM. For optimal
+    // performance we need load/store layouts to have large dense blocks. This
+    // means that in some cases we have to use only a sub-grid of thread group
+    // (i.e. rely on TG slicing) to perform load-store operation, otherwise we
+    // may end up with reorders like 8n16c -> 16c*8n which result in scattered
+    // loads/stores).
+    // At the same time using sub-grids results in higher GRF consumption so we
+    // only enable TG slicing when the resulting sub-grid consists of at least
+    // half of the total threads.
+    int src_reorder_elems = k_iter_blk * src_ic_blk;
+    int src_tg_elems = m_iter_blk * m_tg_dim * k_iter_blk;
+    if (src_tg_elems % tg_size != 0) return;
+    int src_elems_per_thr = src_tg_elems / tg_size;
+    int src_slices = utils::div_up(src_reorder_elems, src_elems_per_thr);
+    if (src_slices > 2) return;
+
+    int dst_reorder_elems = k_iter_blk * dst_oc_blk;
+    int dst_tg_elems = n_iter_blk * n_tg_dim * k_iter_blk;
+    if (dst_tg_elems % tg_size != 0) return;
+    int dst_elems_per_thr = dst_tg_elems / tg_size;
+    int dst_slices = utils::div_up(dst_reorder_elems, dst_elems_per_thr);
+    if (dst_slices > 2) return;
+
+    cfg.set_allow_slm_tg_slicing(true);
+}
+
+void init_reduce_b(conv_config_t &cfg) {
+    const auto &prb = cfg.prb();
+
+    if (prb.is_bwd_w && prb.with_bias) { cfg.set_reduce_b(true); }
+}
+
+void init_assign_sbids(conv_config_t &cfg) {
+    if (cfg.is_dp_fma()) cfg.set_assign_sbids(true);
 }
 
 // Overwrites parameters that are implied by other parameters.
@@ -1914,7 +1909,9 @@ status_t fixup_config(conv_config_t &cfg) {
         if (cfg.thread_group_grid().dim(0) % 2 != 0)
             cfg.set_fma_kind(fma_kind_t::dpas);
         // dpasw can't be generated in case of direct load from GMEM and reorder.
-        if (prb.is_bwd_w && (!cfg.slm().a() || !cfg.slm().b()))
+        if (prb.is_bwd_w
+                && (cfg.allow_a_grf_reorder() || cfg.allow_b_grf_reorder())
+                && (!cfg.slm().a() || !cfg.slm().b()))
             cfg.set_fma_kind(fma_kind_t::dpas);
     }
 
@@ -1930,29 +1927,6 @@ bool in_grid_dims(
             if (*d == dim) return true;
     }
     return false;
-}
-
-status_t check_plan(conv_config_t &cfg) {
-    auto &plan = cfg.plan();
-    ir_assert(cfg.slm().a() == plan.slm.has_a());
-    ir_assert(cfg.slm().b() == plan.slm.has_b());
-    ir_assert(cfg.pipeline().reuse_headers() == plan.reuse_headers);
-
-#ifdef GEN_CONV_DEBUG
-    auto dummy_mem(var_t::make(type_t::byte_ptr(), "mem"));
-    auto dummy_reg(var_t::make(type_t::byte_ptr(), "reg"));
-    if (!cfg.a_load_pattern.matches(
-                plan.x2r.a_load.create_stmt(dummy_mem, dummy_reg))) {
-        ir_warning() << "Generated load for tensor A does not match "
-                     << cfg.a_load_pattern << " load idiom\n";
-    }
-    if (!cfg.b_load_pattern.matches(
-                plan.x2r.b_load.create_stmt(dummy_mem, dummy_reg))) {
-        ir_warning() << "Generated load for tensor B does not match "
-                     << cfg.a_load_pattern << " load idiom\n";
-    }
-#endif
-    return status::success;
 }
 
 status_t check_config(conv_config_t &cfg) {
@@ -1989,8 +1963,77 @@ status_t check_config(conv_config_t &cfg) {
             ir_assert(in_grid_dims(get_kernel_grid_conv_dims, prb, name))
                     << name;
     }
-    CHECK(check_plan(cfg));
     return status::success;
+}
+
+bool try_reduce_grf_usage(conv_config_t &cfg) {
+    const auto &prb = cfg.prb();
+    if (!cfg.reduce_grf_usage()) return true;
+
+    // TODO: improve estimate register count, it fails to account for tmp
+    // values like mask_registers among other things.
+    int max_regs = cfg.regs();
+    int est_regs = estimate_register_count(cfg);
+    if (est_regs <= max_regs) return true;
+
+    // Try to disable GRF buffering.
+    if (cfg.slm().gmem_bufs() > 1) {
+        cfg.slm().set_gmem_bufs(1);
+        int est_regs = estimate_register_count(cfg);
+        if (est_regs <= max_regs) return true;
+    }
+
+    bmnk_dim_helper_t h(cfg);
+
+    // Try to use subtiles for B.
+    if (!cfg.subtiles().is_overridden()) {
+        int n_iter_blk = h.iter_dim('n');
+        int max_b_subtiles
+                = std::min((cfg.slm().b() ? 4 : 2), n_iter_blk / cfg.simd());
+        // XXX: avoid layout mismatch for B loads
+        if (cfg.hw() >= ngen::HW::XeHPC && prb.is_bwd_w)
+            max_b_subtiles = std::min(2, max_b_subtiles);
+        if (h.prb_iter_ndims('n') > 1) max_b_subtiles = 1;
+        while (cfg.subtiles().b() < max_b_subtiles) {
+            cfg.subtiles().set_b(cfg.subtiles().b() * 2);
+            int est_regs = estimate_register_count(cfg);
+            if (est_regs <= max_regs) return true;
+        }
+
+        // Try to use subtiles for A.
+        int m_iter_blk = h.iter_dim('m');
+        int max_a_subtiles = std::min((cfg.slm().a() ? 4 : 2), m_iter_blk / 8);
+        if (cfg.subtiles().b() > 1) max_a_subtiles = 1;
+        if (h.prb_iter_ndims('m') > 1) max_a_subtiles = 1;
+        while (cfg.subtiles().a() < max_a_subtiles) {
+            cfg.subtiles().set_a(cfg.subtiles().a() * 2);
+            int est_regs = estimate_register_count(cfg);
+            if (est_regs <= max_regs) return true;
+        }
+    }
+
+    if (!cfg.slm().is_overridden()) {
+        // Try to use double SLM buffering.
+        if (cfg.slm().bufs() == 3) {
+            cfg.slm().set_bufs(2);
+            int est_regs = estimate_register_count(cfg);
+            if (est_regs <= max_regs) return true;
+        }
+
+        // Try to use single SLM buffering.
+        if (cfg.slm().bufs() == 2) {
+            cfg.slm().set_bufs(1);
+            int est_regs = estimate_register_count(cfg);
+            if (est_regs <= max_regs) return true;
+        }
+    }
+
+    if (!cfg.pipeline().is_overridden()) {
+        // Last resort settings to reduce GRF usage.
+        cfg.pipeline().set(false);
+    }
+
+    return estimate_register_count(cfg) <= max_regs;
 }
 
 status_t try_init_cfg(conv_config_t &cfg) {
@@ -2005,14 +2048,18 @@ status_t try_init_cfg(conv_config_t &cfg) {
     init_padded_dims(cfg);
     init_kernel_grid(cfg);
     init_thread_group_grid(cfg);
-    CHECK(init_plan(cfg));
     init_unroll(cfg);
     init_slm(cfg);
     init_prefetch(cfg);
-    init_subtiles(cfg);
+    init_allow_grf_reorder(cfg);
+    init_allow_slm_tg_slicing(cfg);
+    init_reduce_b(cfg);
+    init_assign_sbids(cfg);
 
     CHECK(fixup_config(cfg));
     CHECK(check_config(cfg));
+
+    if (!try_reduce_grf_usage(cfg)) return status::unimplemented;
 
     return status::success;
 }
@@ -2078,8 +2125,8 @@ status_t init_cfg(conv_config_t &cfg, const convolution_pd_t *pd) {
         // If the kernel fits 128 registers, switch to the normal mode which is
         // expected to have better performance for such cases.
         int bound = (!try_cfg.is_dp_fma() ? 128 : 116);
-        int estimated_peak_regs = estimate_register_count(try_cfg);
-        if (try_regs == 256 && estimated_peak_regs <= bound) {
+        int estimated_peak_grf_usage = estimate_register_count(try_cfg);
+        if (try_regs == 256 && estimated_peak_grf_usage <= bound) {
             try_regs = 128;
             continue;
         }
@@ -2091,11 +2138,28 @@ status_t init_cfg(conv_config_t &cfg, const convolution_pd_t *pd) {
     return ok ? status::success : status::runtime_error;
 }
 
-int conv_config_t::reserved_regs() const {
-    int ret = constants::reserved_regs_default;
-    // XXX: Workaround for incorrect register estimation.
-    if (prb().is_bwd_w && prb().mb % 16 != 0) ret += 4;
-    return ret;
+void conv_config_t::override_set(const std::string &s) {
+    std::vector<param_t *> params;
+    for (auto &gp : get_params_)
+        params.push_back(gp(this));
+    auto parts = ir_utils::split(s);
+    for (auto &p : parts) {
+        auto sub_parts = ir_utils::split(p, "=");
+        ir_assert(sub_parts.size() == 2);
+        auto &key = sub_parts[0];
+        auto &value = sub_parts[1];
+        bool found = false;
+        for (auto *p : params) {
+            if (p->accept_key(key)) {
+                ir_info() << "Override " << p->name() << ": " << key << "="
+                          << value << std::endl;
+                p->override_set(key, value);
+                found = true;
+                break;
+            }
+        }
+        ir_assert(found) << p;
+    }
 }
 
 int get_thread_count(const conv_config_t &cfg) {
@@ -2120,8 +2184,8 @@ float get_thread_utilization(const conv_config_t &cfg) {
 // latency may be an issue due to limited use of SMT to hide the latency.
 float get_wave_utilization(const conv_config_t &cfg) {
     auto arch = convert_ngen_arch_to_dnnl(cfg.hw());
-    int threads_per_eu
-            = compute::device_info_t::threads_per_eu(arch, cfg.regs() > 128);
+    int threads_per_eu = compute::device_info_t::threads_per_eu(
+            arch, cfg.hw_cfg().large_grf_support());
     int slice_eu_count = compute::device_info_t::max_eus_per_wg(arch);
     int slice_count = cfg.hw_cfg().eu_count() / slice_eu_count;
 
@@ -2152,7 +2216,7 @@ std::string conv_config_t::str() const {
         }
         oss << std::endl;
     }
-    int estimated_peak_regs = estimate_register_count(*this);
+    int estimated_peak_grf_usage = estimate_register_count(*this);
     oss << blocking_brief_str();
     oss << "  Kernel grid:                " << kernel_grid() << std::endl;
     oss << "  Thread group:               " << thread_group_grid() << std::endl;
@@ -2165,18 +2229,19 @@ std::string conv_config_t::str() const {
     oss << "  GRF buffers for GMEM load:  " << slm().gmem_bufs() << std::endl;
     oss << "  Prefetch:                   " << to_string(prefetch()) << ", buffers: " << prefetch().bufs() << std::endl;
     oss << "  Do pipeline unroll:         " << to_string(pipeline().do_unroll()) << std::endl;
+    oss << "  Assign SBIDs:               " << to_string(assign_sbids()) << std::endl;
+    oss << "  Reduce GRF usage:           " << to_string(reduce_grf_usage()) << std::endl;
     oss << "  Reuse headers:              " << to_string(pipeline().reuse_headers()) << std::endl;
+    oss << "  Allow GRF reorder:          " << "A: " << to_string(allow_a_grf_reorder()) << ", B: " << to_string(allow_b_grf_reorder()) << std::endl;
     oss << "  Subtiles:                   " << "A: " << subtiles().a() << ", B: " << subtiles().b() << std::endl;
-    oss << "  Estimated GRF usage:        " << estimated_peak_regs << std::endl;
-    oss << "  Configuration line:         " << get_config_line() << std::endl;
+    oss << "  Estimated GRF usage:        " << estimated_peak_grf_usage << std::endl;
     // clang-format on
     return oss.str();
 }
 
 std::string pad_str(std::string s, int pad) {
     auto pos = (pad >= 0 ? 0 : s.length());
-    int off = std::abs(pad) - (int)s.length();
-    s.insert(pos, std::max(off, 0), ' ');
+    s.insert(pos, std::abs(pad) - s.length(), ' ');
     return s;
 }
 
@@ -2206,14 +2271,6 @@ std::string conv_config_t::blocking_brief_str() const {
     return oss.str();
 }
 
-void conv_config_t::set_plan(const std::shared_ptr<conv_plan_t> &plan) {
-    plan_ = plan;
-}
-
-const conv_plan_t &conv_config_t::plan() const {
-    return *plan_;
-}
-
 bool conv_config_t::can_skip_wei_zero_out() const {
     if (!prb().is_bwd_w) return true;
     bmnk_dim_helper_t h(*this);
@@ -2229,6 +2286,66 @@ bool conv_config_t::can_skip_wei_zero_out() const {
 bool conv_config_t::can_skip_bia_zero_out() const {
     if (!prb().is_bwd_w || !prb().with_bias) return true;
     return can_skip_wei_zero_out() && !slm().b();
+}
+
+void init_extra_tensors(const conv_config_t &cfg, tensor_config_t &tensor_cfg) {
+    const auto &prb = cfg.prb();
+    auto &zp_cfg = prb.zp_cfg;
+    auto *pd = prb.conv_pd;
+    auto *attr = prb.attr;
+    if (zp_cfg.do_src_compensation && zp_cfg.is_runtime_src_zero_points) {
+        int zp_ic = (zp_cfg.is_common_src_zero_point) ? 1 : prb.ic;
+        std::vector<dim_t> dims = {zp_ic};
+        layout_t zp_layout(type_t::s32(), 0, dims);
+        int arg_key = DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC;
+        tensor_cfg.add_tensor("src_zero_points", arg_key,
+                /*is_input=*/true, /*is_output=*/false, zp_layout);
+    }
+    if (zp_cfg.do_dst_compensation && zp_cfg.is_runtime_dst_zero_points) {
+        std::vector<dim_t> dims = {prb.oc};
+        layout_t zp_layout(type_t::s32(), 0, dims);
+        int arg_key = DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST;
+        tensor_cfg.add_tensor("dst_zero_points", arg_key,
+                /*is_input=*/true, /*is_output=*/false, zp_layout);
+    }
+    auto scale_args = get_scale_args(prb);
+    const char *scale_names[] = {"src_scales", "wei_scales", "dst_scales"};
+    const int scale_names_len = sizeof(scale_names) / sizeof(scale_names[0]);
+    ir_assert((int)scale_args.size() == scale_names_len);
+    for (int i = 0; i < (int)scale_args.size(); i++) {
+        int arg = scale_args[i];
+        auto &s = attr->scales_.get(arg);
+        if (s.has_default_values()) continue;
+        int dim = s.mask_ == 0 ? 1 : (prb.is_fwd ? prb.oc : prb.ic);
+        std::vector<dim_t> dims = {dim};
+        layout_t layout(type_t::f32(), 0, dims);
+        int arg_key = DNNL_ARG_ATTR_SCALES | arg;
+        tensor_cfg.add_tensor(scale_names[i], arg_key, /*is_input=*/true,
+                /*is_output=*/false, layout);
+    }
+    for (int i = 0; i < attr->post_ops_.len(); i++) {
+        auto &po = attr->post_ops_.entry_[i];
+        if (po.is_eltwise()
+                || po.is_sum(/*require_scale_one=*/false,
+                        /*require_zp_zero=*/false)) {
+            // No extra tensors.
+        } else if (po.is_binary()) {
+            auto layout = make_layout(po.binary.src1_desc);
+            int arg_key = DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1;
+            tensor_cfg.add_tensor("binary_rhs_" + std::to_string(i), arg_key,
+                    /*is_input=*/true,
+                    /*is_output=*/false, layout);
+        } else if (po.is_prelu()) {
+            layout_t layout(type_t::f32(), 0,
+                    get_prelu_weights_dims(
+                            po.prelu.mask, *pd->invariant_dst_md()));
+            int arg_key = DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_WEIGHTS;
+            tensor_cfg.add_tensor("prelu_rhs_" + std::to_string(i), arg_key,
+                    /*is_input=*/true, /*is_output=*/false, layout);
+        } else {
+            ir_error_not_expected();
+        }
+    }
 }
 
 tensor_config_t get_tensor_config(const conv_config_t &cfg) {
@@ -2252,14 +2369,12 @@ tensor_config_t get_tensor_config(const conv_config_t &cfg) {
         tensor_cfg.require_zero_out("wei");
         if (prb.with_bias) tensor_cfg.require_zero_out("bia");
     }
-    init_extra_tensors(cfg.zp_cfg(), *prb.conv_pd->attr(),
-            *prb.conv_pd->invariant_dst_md(), (prb.is_fwd) ? prb.ic : prb.oc,
-            (prb.is_fwd) ? prb.oc : prb.ic, tensor_cfg);
+    init_extra_tensors(cfg, tensor_cfg);
     return tensor_cfg;
 }
 
 int estimate_register_count(const conv_config_t &cfg) {
-    return cfg.plan().grf_usage().total();
+    return estimate_grf_usage(cfg).total();
 }
 
 bool can_use_a_2d_send(const conv_config_t &cfg) {

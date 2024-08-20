@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -787,8 +787,8 @@ status_t generic_reorder_t::pd_t::init_conf(engine_t *engine) {
     memcpy(&new_a, src_md(), sizeof(new_a));
     memcpy(&new_b, dst_md(), sizeof(new_b));
     compress(new_a, new_b, src_mask, dst_mask);
-    if (src_mask) CHECK(attr_copy.scales_.set(DNNL_ARG_SRC, src_mask));
-    if (dst_mask) CHECK(attr_copy.scales_.set(DNNL_ARG_DST, dst_mask));
+    if (src_mask) attr_copy.scales_.set(DNNL_ARG_SRC, src_mask);
+    if (dst_mask) attr_copy.scales_.set(DNNL_ARG_DST, dst_mask);
 
     if (!is_generic_faster_than_ref(new_a, new_b)) return status::unimplemented;
 
@@ -853,7 +853,7 @@ status_t generic_reorder_t::pd_t::init_conf(engine_t *engine) {
     }
     if (vect_size != 1) {
         const auto dim_str = utils::format("D%d", vect_dim);
-        CHECK(conf.dispatch.vectorize_dim(dim_str, vect_size));
+        conf.dispatch.vectorize_dim(dim_str, vect_size);
     }
 
     conf.dispatch.generate();
@@ -949,6 +949,7 @@ status_t generic_reorder_t::pd_t::init_kernel_ctx(
         d_size_so_far *= d.blk_size;
     }
 
+    kernel_ctx.print_options();
     return status::success;
 }
 

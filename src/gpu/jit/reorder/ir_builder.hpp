@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 #include "gpu/jit/ir/ir_builder.hpp"
 #include "gpu/jit/ir/kernel_info.hpp"
 #include "gpu/jit/ir/tensor.hpp"
-#include "gpu/jit/reorder/config.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -34,16 +33,13 @@ namespace jit {
 
 class reorder_ir_builder_t : public ir_builder_t {
 public:
-    reorder_ir_builder_t(const reorder_config_t &cfg,
-            const kernel_info_t &kernel_info, const primitive_attr_t *attr,
-            const memory_desc_t *dst_md)
+    reorder_ir_builder_t(const exec_config_t &exec_cfg,
+            const kernel_info_t &kernel_info, const layout_t &src_layout,
+            const layout_t &dst_layout)
         : ir_builder_t(kernel_info)
-        , src_layout_(cfg.src_layout().user())
-        , dst_layout_(cfg.dst_layout().user())
-        , cfg_(cfg)
-        , attr_(attr)
-        , dst_md_(dst_md) {
-        normalize_reorder_layouts(src_layout_, dst_layout_);
+        , exec_cfg_(exec_cfg)
+        , src_layout_(src_layout)
+        , dst_layout_(dst_layout) {
         build();
     }
 
@@ -65,8 +61,8 @@ public:
             const std::vector<int> &tg_blocks, grid_info_t &kernel_grid,
             grid_info_t &tg_grid, std::vector<int> *dim2grid = nullptr);
 
-    static compute::nd_range_t nd_range(
-            const exec_config_t &exec_cfg, layout_t src, layout_t dst);
+    static compute::nd_range_t nd_range(const exec_config_t &exec_cfg,
+            const layout_t &src, const layout_t &dst);
 
 private:
     void build() override;
@@ -74,7 +70,6 @@ private:
             const std::vector<int> &loop_blocks,
             const std::vector<int> &tg_blocks);
 
-    static void normalize_reorder_layouts(layout_t &a, layout_t &b);
     static dim_t max_tile_size(const hw_config_t &hw_cfg, const layout_t &dst,
             const layout_t &src) {
         // XeHPC is fine with 2048 bytes, XeHPG and below can fit 2048 bytes if
@@ -82,20 +77,11 @@ private:
         return (hw_cfg.hw() <= ngen::HW::XeHPG && dst != src) ? 1024 : 2048;
     }
 
-    static dim_t count_block_messages(
-            const exec_config_t &exec_cfg, dim_t bytes, dim_t iterations);
-    static dim_t count_scattered_messages(
-            const exec_config_t &exec_cfg, dim_t bytes, dim_t iterations);
-    static dim_t message_latency(const exec_config_t &exec_cfg,
-            const layout_t &l, const tensor_t &t);
-
+    exec_config_t exec_cfg_;
     grid_info_t kernel_grid_;
     grid_info_t tg_grid_;
     layout_t src_layout_;
     layout_t dst_layout_;
-    const reorder_config_t &cfg_;
-    const primitive_attr_t *attr_;
-    const memory_desc_t *dst_md_;
 };
 
 } // namespace jit

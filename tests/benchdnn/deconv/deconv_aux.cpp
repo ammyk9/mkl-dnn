@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -13,8 +13,6 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 *******************************************************************************/
-
-#include <sstream>
 
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
@@ -78,23 +76,11 @@ int str2desc(desc_t *desc, const char *str) {
             s += strlen(prb); \
             char *end_s; \
             d.c = strtol(s, &end_s, 10); \
-            if (end_s == s) { \
-                BENCHDNN_PRINT(0, \
-                        "ERROR: No value found for `%s` setting. Full " \
-                        "descriptor input: `%s`.\n", \
-                        prb, str); \
-                return FAIL; \
-            } \
             s += (end_s - s); \
             /* check any # groups, including one, works correctly */ \
             if (!strncmp(prb, "g", 1)) d.has_groups = true; \
-            if (d.c < 0) { \
-                BENCHDNN_PRINT(0, \
-                        "ERROR: `%s` must be positive. Full descriptor " \
-                        "input: `%s`.\n", \
-                        prb, str); \
-                return FAIL; \
-            } \
+            if (d.c < 0) return FAIL; \
+            /* printf("@@@debug: %s: %d\n", prb, d. c); */ \
         } \
     } while (0)
 #define CASE_N(c) CASE_NN(#c, c)
@@ -127,50 +113,14 @@ int str2desc(desc_t *desc, const char *str) {
             break;
         }
         if (*s == '_') ++s;
-        if (!ok) {
-            BENCHDNN_PRINT(0,
-                    "ERROR: Unrecognized pattern in `%s` descriptor starting "
-                    "from `%s` entry.\n",
-                    str, s);
-            return FAIL;
-        }
+        if (!ok) return FAIL;
     }
 #undef CASE_NN
 #undef CASE_N
 
-#define CHECK_SET_OR_ZERO_VAL(val_str, val) \
-    if ((val) <= 0) { \
-        assert((val_str)[0] == 'd' && (val_str)[1] == '.'); \
-        const char *val_str__ = &(val_str)[2]; \
-        BENCHDNN_PRINT(0, \
-                "ERROR: setting `%s` was not specified or set to 0. Full " \
-                "descriptor input: `%s`.\n", \
-                val_str__, str); \
-        return FAIL; \
-    }
-
-#define CHECK_SET_OR_ZERO(val) CHECK_SET_OR_ZERO_VAL(#val, val)
-
-    CHECK_SET_OR_ZERO(d.g);
-    CHECK_SET_OR_ZERO(d.ic);
-    CHECK_SET_OR_ZERO(d.oc);
-    CHECK_SET_OR_ZERO(d.sd);
-    CHECK_SET_OR_ZERO(d.sh);
-    CHECK_SET_OR_ZERO(d.sw);
-
-#define CHECK_DEDUCED_ZERO_VAL(val_str, val) \
-    if ((val) <= 0) { \
-        assert((val_str)[0] == 'd' && (val_str)[1] == '.'); \
-        const char *val_str__ = &(val_str)[2]; \
-        BENCHDNN_PRINT(0, \
-                "ERROR: `%s` was not specified but rest provided dimensions " \
-                "result in negative or zero value. Full descriptor input: " \
-                "`%s`.\n", \
-                val_str__, str); \
-        return FAIL; \
-    }
-
-#define CHECK_DEDUCED_ZERO(val) CHECK_DEDUCED_ZERO_VAL(#val, val)
+    if (d.has_groups && d.g <= 0) return FAIL;
+    if (d.ic == 0 || d.oc == 0) return FAIL;
+    if (d.sd <= 0 || d.sh <= 0 || d.sw <= 0) return FAIL;
 
     auto compute_out
             = [](int64_t i, int64_t k, int64_t s, int64_t p, int64_t d) {
@@ -186,42 +136,38 @@ int str2desc(desc_t *desc, const char *str) {
     const bool no_w = (d.iw | d.kw | d.ow | d.dw) == 0 && d.sw == 1 && d.pw < 1;
 
     if (!no_d) {
-        CHECK_SET_OR_ZERO(d.id);
-        CHECK_SET_OR_ZERO(d.kd);
+        if (!d.id || !d.kd) return FAIL;
         if (!d.od) {
             if (d.pd < 0) d.pd = 0;
             d.od = compute_out(d.id, d.kd, d.sd, d.pd, d.dd);
-            CHECK_DEDUCED_ZERO(d.od);
+            if (d.od <= 0) return FAIL;
         } else if (d.pd < 0)
             d.pd = compute_pad(d.od, d.id, d.kd, d.sd, d.dd);
     }
 
     if (!no_h) {
-        CHECK_SET_OR_ZERO(d.ih);
-        CHECK_SET_OR_ZERO(d.kh);
+        if (!d.ih || !d.kh) return FAIL;
         if (!d.oh) {
             if (d.ph < 0) d.ph = 0;
             d.oh = compute_out(d.ih, d.kh, d.sh, d.ph, d.dh);
-            CHECK_DEDUCED_ZERO(d.oh);
+            if (d.oh <= 0) return FAIL;
         } else if (d.ph < 0)
             d.ph = compute_pad(d.oh, d.ih, d.kh, d.sh, d.dh);
     }
 
     if (!no_w) {
-        CHECK_SET_OR_ZERO(d.iw);
-        CHECK_SET_OR_ZERO(d.kw);
+        if (!d.iw || !d.kw) return FAIL;
         if (!d.ow) {
             if (d.pw < 0) d.pw = 0;
             d.ow = compute_out(d.iw, d.kw, d.sw, d.pw, d.dw);
-            CHECK_DEDUCED_ZERO(d.ow);
+            if (d.ow <= 0) return FAIL;
         } else if (d.pw < 0)
             d.pw = compute_pad(d.ow, d.iw, d.kw, d.sw, d.dw);
     }
 
     if (sanitize_desc(d.ndims, {d.od, d.id, d.kd, d.sd, d.pd, d.dd},
                 {d.oh, d.ih, d.kh, d.sh, d.ph, d.dh},
-                {d.ow, d.iw, d.kw, d.sw, d.pw, d.dw}, {1, 1, 1, 1, 0, 0}, str,
-                true)
+                {d.ow, d.iw, d.kw, d.sw, d.pw, d.dw}, {1, 1, 1, 1, 0, 0}, true)
             != OK)
         return FAIL;
 
@@ -229,16 +175,6 @@ int str2desc(desc_t *desc, const char *str) {
     *desc = d;
 
     return OK;
-}
-
-dnnl_data_type_t prb_t::get_dt(data_kind_t data_kind) const {
-    switch (data_kind) {
-        case SRC: return src_dt();
-        case WEI: return wei_dt();
-        case BIA: return bia_dt();
-        case DST: return dst_dt();
-        default: assert(!"unexpected data_kind"); return dnnl_data_type_undef;
-    }
 }
 
 std::ostream &operator<<(std::ostream &s, const desc_t &d) {
@@ -392,31 +328,83 @@ void prb_t::count_ops() {
     ops = 2 * this->mb * this->oc * this->ic / this->g * sp_ops;
 }
 
-std::string prb_t::set_repro_line() {
-    std::stringstream s;
+float *prb_t::generate_scales(int arg) {
+    const auto &scales = attr.scales;
+    if (scales.is_def()) return nullptr;
+
+    const auto &e = scales.get(arg);
+    if (e.policy == policy_t::COMMON) {
+        float *s = (float *)zmalloc(sizeof(float), 4);
+        SAFE_V(s != nullptr ? OK : FAIL);
+        s[0] = e.scale;
+        return s;
+    }
+
+    assert(e.policy == policy_t::PER_OC);
+    auto mask = attr_t::get_default_mask(e.policy, arg);
+    if (arg == DNNL_ARG_WEIGHTS && has_groups) mask = (1 << mask) + 1;
+    int64_t s_nelems = desc_nelems(arg, mask);
+
+    float *s = (float *)zmalloc(sizeof(float) * s_nelems, 64);
+    SAFE_V(s != nullptr ? OK : FAIL);
+
+    const float K = 32;
+    /* scale in [1/K .. K], with starting point at e.scale */
+    float s_val[2] = {e.scale, e.scale / 2};
+    for (int64_t i = 0; i < s_nelems; ++i) {
+        int64_t si = i % 2; // 0 -> left, 1 -> right
+        s[i] = s_val[si];
+        if (si == 0) {
+            s_val[si] /= 2.;
+            // turn around to become ~K
+            if (s_val[si] < 1. / K) s_val[si] *= K * K;
+        } else {
+            s_val[si] *= 2.;
+            // turn around to become ~K
+            if (s_val[si] > K) s_val[si] /= K * K;
+        }
+    }
+    return s;
+}
+
+int32_t *prb_t::generate_zero_points(int arg) {
+    const auto &zp = attr.zero_points;
+    if (zp.is_def(arg)) return nullptr;
+
+    const auto &e = zp.get(arg);
+    const auto mask = attr_t::get_default_mask(e.policy);
+    int64_t zp_nelems = desc_nelems(arg, mask);
+
+    int32_t *ptr = (int32_t *)zmalloc(sizeof(int32_t) * zp_nelems, 64);
+    SAFE_V(ptr != nullptr ? OK : FAIL);
+
+    for (int i = 0; i < zp_nelems; ++i)
+        ptr[i] = e.value + i % 3;
+
+    return ptr;
+}
+
+std::ostream &operator<<(std::ostream &s, const prb_t &prb) {
     dump_global_params(s);
     settings_t def;
 
-    bool has_default_dts = true;
-    for (const auto &i_dt : dt)
-        has_default_dts = has_default_dts && i_dt == dnnl_f32;
+    if (canonical || prb.dir != def.dir[0]) s << "--dir=" << prb.dir << " ";
+    if (canonical || prb.cfg != def.cfg[0]) s << "--cfg=" << prb.cfg << " ";
+    if (canonical || prb.stag != def.stag[0]) s << "--stag=" << prb.stag << " ";
+    if (canonical || prb.wtag != def.wtag[0]) s << "--wtag=" << prb.wtag << " ";
+    if (canonical || prb.dtag != def.dtag[0]) s << "--dtag=" << prb.dtag << " ";
+    if (canonical || prb.alg != def.alg[0])
+        s << "--alg=" << alg2str(prb.alg) << " ";
 
-    if (canonical || dir != def.dir[0]) s << "--dir=" << dir << " ";
-    if (canonical || !has_default_dts) s << "--dt=" << dt << " ";
-    if (canonical || stag != def.stag[0]) s << "--stag=" << stag << " ";
-    if (canonical || wtag != def.wtag[0]) s << "--wtag=" << wtag << " ";
-    if (canonical || dtag != def.dtag[0]) s << "--dtag=" << dtag << " ";
-    if (canonical || alg != def.alg[0]) s << "--alg=" << alg2str(alg) << " ";
+    s << prb.attr;
+    if (canonical || prb.ctx_init != def.ctx_init[0])
+        s << "--ctx-init=" << prb.ctx_init << " ";
+    if (canonical || prb.ctx_exe != def.ctx_exe[0])
+        s << "--ctx-exe=" << prb.ctx_exe << " ";
 
-    s << attr;
-    if (canonical || ctx_init != def.ctx_init[0])
-        s << "--ctx-init=" << ctx_init << " ";
-    if (canonical || ctx_exe != def.ctx_exe[0])
-        s << "--ctx-exe=" << ctx_exe << " ";
+    s << static_cast<const desc_t &>(prb);
 
-    s << static_cast<const desc_t &>(*this);
-
-    return s.str();
+    return s;
 }
 
 } // namespace deconv

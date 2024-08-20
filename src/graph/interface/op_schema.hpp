@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #ifndef GRAPH_INTERFACE_OP_SCHEMA_HPP
 #define GRAPH_INTERFACE_OP_SCHEMA_HPP
 
-#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -33,7 +32,6 @@
 #include "graph/interface/c_types_map.hpp"
 #include "graph/interface/op.hpp"
 
-#include "graph/utils/any.hpp"
 #include "graph/utils/attribute_value.hpp"
 
 namespace dnnl {
@@ -43,26 +41,32 @@ namespace graph {
 using opset_version = size_t;
 using shape_infer_fn = std::function<status_t(op_t *,
         std::vector<logical_tensor_t *> &, std::vector<logical_tensor_t *> &)>;
-using op_def_constraint_fn = std::function<bool(const op_t *)>;
+using type_constraint_fn = std::function<bool(const op_t *)>;
 
 class op_schema_t {
 public:
     op_schema_t();
     op_schema_t(op_kind_t op_name, opset_version version);
 
-    /*! @brief op parameter representation, including input/output name.
+    /*! @brief op parameter representation, including input/output name,
+     *  and description.
      */
     class op_parameter_t {
     public:
         op_parameter_t() = default;
 
-        explicit op_parameter_t(std::string &&name, std::string &&dtype_string)
+        explicit op_parameter_t(std::string &&name, std::string &&description,
+                std::string &&dtype_string)
             : name_(std::move(name))
+            , description_(std::move(description))
             , dtype_string_(std::move(dtype_string))
             , is_initialized(true) {}
 
         // op parameter name.
         std::string name_;
+
+        // op parameter description.
+        std::string description_;
 
         // op parameter dtype string.
         std::string dtype_string_;
@@ -76,15 +80,14 @@ public:
         attribute_t() = default;
 
         // constructor for optional attributes which need to have default value
-        attribute_t(op_attr_t name, bool required, attribute_kind_t attr_kind,
-                utils::attribute_value_t value,
-                std::vector<utils::attribute_value_t> &&candidates = {})
+        attribute_t(op_attr_t name, std::string &&description, bool required,
+                attribute_kind_t attr_kind, utils::attribute_value_t value)
             : name_(name)
+            , description_(std::move(description))
             , required_(false)
             , has_default_value_(true)
             , attr_kind_(attr_kind)
-            , attr_(std::move(value))
-            , candidates_(std::move(candidates)) {
+            , attr_(std::move(value)) {
             assertm(!required,
                     "this attribute should be an optional attribute "
                     "since default value is provided");
@@ -93,16 +96,19 @@ public:
 
         // constructor for required attributes or special optional attributes
         // that have no default value.
-        attribute_t(op_attr_t name, bool required, attribute_kind_t attr_kind,
-                std::vector<utils::attribute_value_t> &&candidates = {})
+        attribute_t(op_attr_t name, std::string &&description, bool required,
+                attribute_kind_t attr_kind)
             : name_(name)
+            , description_(std::move(description))
             , required_(required)
             , has_default_value_(false)
-            , attr_kind_(attr_kind)
-            , candidates_(std::move(candidates)) {}
+            , attr_kind_(attr_kind) {}
 
         // op attribute name.
         op_attr_t name_;
+
+        // op attribute description.
+        std::string description_;
 
         // whether the attribute is required or not.
         bool required_;
@@ -117,9 +123,6 @@ public:
 
         // default value for the attribute
         utils::attribute_value_t attr_;
-
-        // predefined valid attribute value candidates
-        std::vector<utils::attribute_value_t> candidates_;
     };
 
     enum class param_num_option { fixed, optional, variadic };
@@ -128,6 +131,12 @@ public:
 
     /*! @brief Set the op_kind of this op schema. */
     op_schema_t &set_op_kind(op_kind_t kind);
+
+    /*! @brief Returns the docstring of this op schema. */
+    const std::string &get_doc() const;
+
+    /*! @brief Set the docstring of this op schema. */
+    op_schema_t &set_doc(std::string &&doc);
 
     /*! @brief Returns the since version of this op schema. */
     opset_version get_since_version() const;
@@ -161,11 +170,11 @@ public:
 
     /*! @brief Set a particular input of the op schema. */
     op_schema_t &set_input(size_t in_offset, std::string &&in_name,
-            std::string &&dtype_string = "any");
+            std::string &&in_description, std::string &&dtype_string = "any");
 
     /*! @brief Set a particular output of the op schema. */
     op_schema_t &set_output(size_t out_offset, std::string &&out_name,
-            std::string &&dtype_string = "any");
+            std::string &&out_description, std::string &&dtype_string = "any");
 
     /*! @brief Enable commutative inputs */
     op_schema_t &set_commutative_inputs();
@@ -177,30 +186,23 @@ public:
             std::string &&dtype_string, std::set<data_type_t> &&dtypes);
 
     /*! @brief Set a particular attribute of the op schema. */
-    op_schema_t &set_attr(op_attr_t name, bool required,
-            attribute_kind_t attr_kind,
-            const std::vector<const char *> &candidates = {});
+    op_schema_t &set_attr(op_attr_t name, std::string &&description,
+            bool required, attribute_kind_t attr_kind);
 
     /*! @brief Set a particular attribute of the op schema. */
     template <typename T>
-    op_schema_t &set_attr(op_attr_t name, bool required,
-            attribute_kind_t attr_kind, T value,
-            const std::vector<T> &candidates = {}) {
+    op_schema_t &set_attr(op_attr_t name, std::string &&description,
+            bool required, attribute_kind_t attr_kind, T value) {
         assertm(attributes_.count(name) == 0,
                 "provided attribute has already been set");
-        std::vector<utils::attribute_value_t> candidates_tmp(candidates.size());
-        std::transform(candidates.begin(), candidates.end(),
-                candidates_tmp.begin(),
-                [](const T &c) { return utils::attribute_value_t {c}; });
-        attributes_[name] = attribute_t(name, required, attr_kind,
-                utils::attribute_value_t(value), std::move(candidates_tmp));
+        attributes_[name] = attribute_t(
+                name, std::move(description), required, attr_kind, {value});
         return *this;
     }
 
     /*! @brief Set a particular attribute of the op schema. */
-    op_schema_t &set_attr(op_attr_t name, bool required,
-            attribute_kind_t attr_kind, const char *value,
-            const std::vector<const char *> &candidates = {});
+    op_schema_t &set_attr(op_attr_t name, std::string &&description,
+            bool required, attribute_kind_t attr_kind, const char *value);
 
     /*! @brief Set shape inference function of the op schema. */
     op_schema_t &set_shape_inference_function(shape_infer_fn fn);
@@ -208,11 +210,11 @@ public:
     /*! @brief Get shape inference function of the op schema. */
     shape_infer_fn get_shape_inference_function() const;
 
-    /*! @brief Set sanity constraint function of the op schema. */
-    op_schema_t &set_op_def_constraint_function(op_def_constraint_fn fn);
+    /*! @brief Set type constraint function of the op schema. */
+    op_schema_t &set_type_constraint_function(type_constraint_fn fn);
 
-    /*! @brief Get sanity constraint functions of the op schema. */
-    std::vector<op_def_constraint_fn> get_op_def_constraint_functions() const;
+    /*! @brief Get type constraint function of the op schema. */
+    type_constraint_fn get_type_constraint_function() const;
 
     /*! @brief Get inputs of the op schema. */
     const std::vector<op_parameter_t> &get_inputs() const;
@@ -284,6 +286,7 @@ private:
     size_t get_max_valid_param_num(
             const std::set<size_t> &param_num, param_num_option option) const;
 
+    std::string doc_ = "";
     op_kind_t op_kind_;
     opset_version version_;
     std::set<size_t> num_inputs_;
@@ -299,7 +302,7 @@ private:
     std::vector<op_parameter_t> outputs_;
     std::unordered_map<op_attr_t, attribute_t> attributes_;
     shape_infer_fn tensor_inference_function_ = nullptr;
-    std::vector<op_def_constraint_fn> op_def_constraint_functions_;
+    type_constraint_fn op_type_constraint_function_ = nullptr;
     bool commutative_inputs_enabled_ = false;
     // type erased key-value storage
     std::unordered_map<std::string, utils::any_t> additional_items_map_;
@@ -353,38 +356,48 @@ op_schema_t get_op_schema();
     }
 
 #define SET_MATMUL_COMMON_ATTRS \
-    set_attr(op_attr::transpose_a, false, attribute_kind::b, false) \
-            .set_attr(op_attr::transpose_b, false, attribute_kind::b, false)
+    set_attr(op_attr::transpose_a, \
+            "transposes dimensions ROW_INDEX_DIM and COL_INDEX_DIM " \
+            "of the first input", \
+            false, attribute_kind::b, false) \
+            .set_attr(op_attr::transpose_b, \
+                    "transposes dimensions ROW_INDEX_DIM and COL_INDEX_DIM " \
+                    "of the second input", \
+                    false, attribute_kind::b, false)
 
 #define SET_CONV_COMMON_ATTRS \
-    set_attr(op_attr::strides, true, attribute_kind::is) \
-            .set_attr(op_attr::pads_begin, true, attribute_kind::is) \
-            .set_attr(op_attr::pads_end, true, attribute_kind::is) \
-            .set_attr(op_attr::dilations, true, attribute_kind::is) \
-            .set_attr(op_attr::auto_pad, false, attribute_kind::s, "None", \
-                    {"None", "SAME_UPPER", "SAME_LOWER", "VALID"}) \
-            .set_attr(op_attr::groups, false, attribute_kind::i, (int64_t)1) \
-            .set_attr(op_attr::data_format, false, attribute_kind::s, "NXC", \
-                    {"NXC", "NCX"}) \
-            .set_attr(op_attr::weights_format, false, attribute_kind::s, \
-                    "XIO", {"XIO", "OIX"})
-
-#define SET_CONVTRANSPOSE_COMMON_ATTRS \
-    set_attr(op_attr::strides, true, attribute_kind::is) \
-            .set_attr(op_attr::pads_begin, true, attribute_kind::is) \
-            .set_attr(op_attr::pads_end, true, attribute_kind::is) \
-            .set_attr(op_attr::dilations, true, attribute_kind::is) \
-            .set_attr(op_attr::auto_pad, false, attribute_kind::s, "None", \
-                    {"None", "SAME_UPPER", "SAME_LOWER", "VALID"}) \
-            .set_attr(op_attr::groups, false, attribute_kind::i, (int64_t)1) \
-            .set_attr(op_attr::data_format, false, attribute_kind::s, "NXC", \
-                    {"NXC", "NCX"}) \
-            .set_attr(op_attr::weights_format, false, attribute_kind::s, \
-                    "XOI", {"XOI", "IOX"})
+    set_attr(op_attr::strides, "the distance to slide the filter", true, \
+            attribute_kind::is) \
+            .set_attr(op_attr::pads_begin, "top and left padding", true, \
+                    attribute_kind::is) \
+            .set_attr(op_attr::pads_end, "bottom and right padding", true, \
+                    attribute_kind::is) \
+            .set_attr(op_attr::dilations, \
+                    "the distance in width and height between elements " \
+                    "in the filter", \
+                    true, attribute_kind::is) \
+            .set_attr(op_attr::auto_pad, "how the padding is calculated", \
+                    false, attribute_kind::s, "None") \
+            .set_attr(op_attr::groups, \
+                    "the number of groups input / output channels are " \
+                    "divided into", \
+                    false, attribute_kind::i, (int64_t)1) \
+            .set_attr(op_attr::data_format, \
+                    "the data format of input / output, the options are " \
+                    "NCX and NXC", \
+                    false, attribute_kind::s, "NXC") \
+            .set_attr(op_attr::weights_format, \
+                    "the format of weight, the options are OIX, XIO", false, \
+                    attribute_kind::s, "XIO")
 
 #define SET_REDUCE_COMMON_ATTRS \
-    set_attr(op_attr::axes, false, attribute_kind::is, std::vector<int64_t>()) \
-            .set_attr(op_attr::keep_dims, false, attribute_kind::b, false)
+    set_attr(op_attr::axes, \
+            "specifies indices of input data, along which the reduction is " \
+            "performed.", \
+            false, attribute_kind::is, std::vector<int64_t>()) \
+            .set_attr(op_attr::keep_dims, \
+                    "if true, holds axes that are used for reduction.", false, \
+                    attribute_kind::b, false)
 
 } // namespace graph
 } // namespace impl

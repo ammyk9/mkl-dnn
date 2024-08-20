@@ -152,11 +152,10 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
             // check if can use post-sum, otherwise use binary post ops
             // algorithm should be binary_add
             bool is_post_sum = alg == dnnl::algorithm::binary_add;
-            // base_op should not be eltwise, pool, or softmax.
+            // base_op should not be eltwise or pool
             is_post_sum = is_post_sum
                     && !impl::utils::one_of(op->get_kind(),
-                            op_kind::dnnl_eltwise, op_kind::dnnl_pool,
-                            op_kind::dnnl_softmax, op_kind::dnnl_logsoftmax);
+                            op_kind::dnnl_eltwise, op_kind::dnnl_pool);
             // only support one post-sum
             is_post_sum = is_post_sum
                     && !(op->has_attr(op_attr::with_sum)

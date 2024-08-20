@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2022 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +45,18 @@ status_t fuse_to_shuffle(std::shared_ptr<subgraph_t> &sg);
 
 status_t replace_quant_data_with_binary_post_op(
         std::shared_ptr<subgraph_t> &sg);
+
+// fold the output scales of int8 conv/deconv/matmul/reorder+add pattern into
+// the input scales of add:
+///
+/// conv/deconv/matmul/reorder         conv/deconv/matmul/reorder
+///           |                                   |
+///     mul_scales0 mul_scales1   -->        mul_scales0 *    mul_scales1 *
+///            \   /                          mul_scales2      mul_scales2
+///             add                                      \   /
+///              |                                        add
+///         mul_scales2                                    |
+status_t fold_sum_scales(std::shared_ptr<subgraph_t> &sg);
 
 status_t fuse_post_ops(std::shared_ptr<subgraph_t> &sg);
 
@@ -142,15 +154,9 @@ status_t fuse_adjacent_reorders(std::shared_ptr<subgraph_t> &sg);
 
 status_t fuse_typecast_to_mul_scales(std::shared_ptr<subgraph_t> &sg);
 
-// This pass handle dynamic quantization:mul_scale+add_zp
 status_t fuse_dynamic_mul_scales_add_zps(std::shared_ptr<subgraph_t> &sg);
 
-// This pass handle dynamic dequantization:sub_zp+mul_scale
 status_t fuse_dynamic_sub_zps_mul_scales(std::shared_ptr<subgraph_t> &sg);
-
-// This pass is used to convert single mul_scale,add_zp,sub_zp to reorder
-// After "remove_quant_data_with_no_effect", maybe there is only single op.
-impl::status_t convert_dynamic_quantize_ops(std::shared_ptr<subgraph_t> &sg);
 
 status_t reorder_canonicalization(std::shared_ptr<subgraph_t> &sg);
 
@@ -176,6 +182,8 @@ status_t combine_binary_post_op_scales(std::shared_ptr<subgraph_t> &sg);
 // - zero points = [0] or [0, ..., 0]
 status_t remove_quant_data_with_no_effect(std::shared_ptr<subgraph_t> &sg);
 
+status_t move_scalar_div_behind_matmul(std::shared_ptr<subgraph_t> &sg);
+
 // This pass will move per_tensor quantize before Reshape and Transpose. So that
 // it can have the opportunity to be fused into computation operators
 impl::status_t lift_up_quantize(std::shared_ptr<subgraph_t> &sg);
@@ -187,10 +195,6 @@ impl::status_t lift_up_typecast(std::shared_ptr<subgraph_t> &sg);
 // This pass will compute matmul with the dst layout of following transpose if
 // the operator after transpose need a dense layout
 impl::status_t fuse_dst_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg);
-
-// This pass will fold add_zps into the previous sub_zps with new_zps = sub_zps
-// - add_zps
-impl::status_t fold_sub_zps_add_zps(std::shared_ptr<subgraph_t> &sg);
 
 status_t convert_to_runtime_src_zero_points(std::shared_ptr<subgraph_t> &sg);
 
@@ -211,38 +215,6 @@ status_t fuse_dst_scales(std::shared_ptr<subgraph_t> &sg);
 status_t convert_bias_to_f32(std::shared_ptr<subgraph_t> &sg);
 
 status_t expand_convtranspose_scales(std::shared_ptr<subgraph_t> &sg);
-
-// swap relu and mul_scales so that mul_scales can be folded into previous
-// layers:
-///        bn                                  bn
-///         |                                   |
-///       relu                              mul_scales
-///         |                                   |
-///     mul_scales                             relu
-///         |                                   |
-impl::status_t swap_relu_mul_scales(std::shared_ptr<subgraph_t> &sg);
-
-/// This pass will move the effect of dequant to gamma and beta
-/// Formula:
-///  original: dst = (gamma * (src - mean) / sqrt(variance + epsilon)) + beta
-///  apply_pre_mul_scale:
-///      dst = (gamma * (src * scale - mean) / sqrt(variance + epsilon)) + beta
-///  ==> dst = (gamma * scale * (src - mean / scale) /
-///  sqrt(variance + epsilon)) + beta
-///  ==> dst = (new_gamma * (src - new_mean) / sqrt(variance + epsilon))
-///  + beta
-impl::status_t fold_pre_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg);
-
-/// This pass will move the effect of quant to gamma and beta
-/// Formula:
-///  original: dst = (gamma * (src - mean) / sqrt(variance + epsilon)) + beta
-///  apply_post_mul_scale:
-///      dst = ((gamma * (src - mean) / sqrt(variance + epsilon)) + beta) *
-///  scale
-///  ==> dst = (gamma * scale) * (src - mean) / sqrt(variance + epsilon) +
-///  (beta * scale)
-///  ==> dst = (new_gamma * (src - mean) / sqrt(variance + epsilon)) + new_beta
-impl::status_t fold_post_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg);
 
 } // namespace dnnl_impl
 } // namespace graph

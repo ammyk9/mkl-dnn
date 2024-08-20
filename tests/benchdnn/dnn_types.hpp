@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -78,7 +78,6 @@ enum data_kind_t {
     WEI,
     BIA,
     DST,
-    DIFF_DST,
     ACC,
     // bnorm, lnorm
     SRC_1,
@@ -120,41 +119,54 @@ struct attr_t {
 
     static policy_t str2policy(const std::string &str);
     static const char *policy2str(policy_t policy);
-    static int get_default_mask(policy_t policy);
+    static int get_default_mask(policy_t policy, int arg = DNNL_ARG_DST);
+
+    struct scale_t {
+        scale_t(policy_t apolicy = COMMON, float ascale = 1.,
+                bool aruntime = false)
+            : policy(apolicy), scale(ascale), runtime(aruntime) {}
+
+        int from_str(const std::string &s);
+
+        bool is_def() const {
+            return policy == COMMON && scale == 1. && runtime == false;
+        }
+
+        policy_t policy = COMMON;
+        float scale = 1.;
+        bool runtime = false;
+    };
 
     struct zero_points_t {
         struct entry_t {
-            entry_t(policy_t apolicy = COMMON, int avalue = 0)
-                : policy(apolicy), value(avalue) {}
+            entry_t(policy_t apolicy = COMMON, int avalue = 0,
+                    bool aruntime = false)
+                : policy(apolicy), value(avalue), runtime(aruntime) {}
 
             entry_t(const entry_t &other)
-                : policy(other.policy), value(other.value) {}
+                : policy(other.policy)
+                , value(other.value)
+                , runtime(other.runtime) {}
 
-            bool is_def() const { return policy == COMMON && value == 0; }
+            bool is_def() const {
+                return policy == COMMON && value == 0 && runtime == false;
+            }
 
             policy_t policy = COMMON;
             int value = 0;
+            bool runtime = false;
         };
 
         int from_str(const std::string &s);
 
         int operator[](int arg) const { return get(arg).value; }
+        bool runtime(int arg) const { return get(arg).runtime; }
 
-        bool is_def(int arg) const {
-            return points.empty() || get(arg).is_def();
-        }
-        bool is_def() const {
-            if (points.empty()) return true;
+        bool is_def(int arg) const { return get(arg).is_def(); }
+        bool is_def() const { return points.empty(); }
 
-            bool def = true;
-            for (const auto &e : points) {
-                def = def && is_def(e.first);
-            }
-            return def;
-        }
-
-        void set(int arg, policy_t policy, int value) {
-            set(arg, entry_t(policy, value));
+        void set(int arg, policy_t policy, int value, bool runtime) {
+            set(arg, entry_t(policy, value, runtime));
         }
         void set(int arg, const entry_t &entry) {
             if (!entry.is_def()) points[arg] = entry;
@@ -176,42 +188,15 @@ struct attr_t {
     };
 
     struct arg_scales_t {
-        struct entry_t {
-            entry_t(policy_t apolicy = COMMON, float ascale = 1.f)
-                : policy(apolicy), scale(ascale) {}
+        void set(int arg, scale_t scale) { scales[arg] = scale; }
 
-            int from_str(const std::string &s);
-
-            bool is_def() const { return policy == COMMON && scale == 1.f; }
-
-            int policy2mask(int arg,
-                    dnnl_primitive_kind_t prim_kind = dnnl_undefined_primitive,
-                    bool has_groups = false) const;
-
-            policy_t policy = COMMON;
-            float scale = 1.f;
-        };
-
-        void set(int arg, entry_t scale) { scales[arg] = scale; }
-
-        entry_t get(int arg) const {
+        scale_t get(int arg) const {
             const auto &s = scales.find(arg);
-            return s == scales.end() ? entry_t() : s->second;
+            return s == scales.end() ? scale_t() : s->second;
         }
 
-        int get_mask(int arg,
-                dnnl_primitive_kind_t prim_kind = dnnl_undefined_primitive,
-                bool has_groups = false) const {
-            const auto &e = get(arg);
-            return e.policy2mask(arg, prim_kind, has_groups);
-        }
-
-        bool is_def(int arg) const {
-            return scales.empty() || get(arg).is_def();
-        }
+        bool is_def(int arg) const { return get(arg).is_def(); }
         bool is_def() const {
-            if (scales.empty()) return true;
-
             bool def = true;
             for (const auto &e : scales) {
                 def = def && is_def(e.first);
@@ -222,7 +207,7 @@ struct attr_t {
 
         arg_scales_t() : scales() {} // needed for debug icc190 build;
 
-        std::map<int, entry_t> scales;
+        std::map<int, scale_t> scales;
     };
 
     struct post_ops_t {
@@ -294,9 +279,9 @@ struct attr_t {
                 } else if (is_eltwise_kind()) {
                     eltwise.alg = kind2dnnl_kind(kind);
                 } else if (is_convolution_kind()) {
-                    convolution.src_scale = arg_scales_t::entry_t();
-                    convolution.wei_scale = arg_scales_t::entry_t();
-                    convolution.dst_scale = arg_scales_t::entry_t();
+                    convolution.src_scale = scale_t();
+                    convolution.wei_scale = scale_t();
+                    convolution.dst_scale = scale_t();
                     if (kind != DW) {
                         convolution.kernel = 3;
                         convolution.stride = kind == DW_K3S1P1 ? 1 : 2;
@@ -323,9 +308,9 @@ struct attr_t {
                 int stride = 0;
                 int padding = 0;
                 dnnl_data_type_t dst_dt = dnnl_f32;
-                arg_scales_t::entry_t src_scale;
-                arg_scales_t::entry_t wei_scale;
-                arg_scales_t::entry_t dst_scale;
+                scale_t src_scale;
+                scale_t wei_scale;
+                scale_t dst_scale;
             } convolution;
             struct {
                 dnnl_alg_kind_t alg = dnnl_alg_kind_undef;
@@ -363,7 +348,7 @@ struct attr_t {
     };
 
     attr_t()
-        : scratchpad_mode(get_default_scratchpad_mode())
+        : scratchpad_mode(dnnl_scratchpad_mode_library)
         , fpmath_mode(dnnl_fpmath_mode_strict) {}
 
     template <typename First, typename... Rest>
@@ -377,17 +362,6 @@ struct attr_t {
     void insert(const post_ops_t &po) { this->post_ops = po; }
     void insert(dnnl_scratchpad_mode_t sm) { this->scratchpad_mode = sm; }
     void insert(dnnl_fpmath_mode_t fpm) { this->fpmath_mode = fpm; }
-
-    // When parallel creation modifier is enabled, the library scratchpad mode
-    // can't be used unless "-DDNNL_ENABLE_CONCURRENT_EXEC=ON" is enabled at the
-    // build time, otherwise scratchpad pointers are invalidated (as were
-    // created inside threads that no longer exist when execution time comes).
-    // Relevant for both engines since GPU uses CPU for faster validation.
-    static dnnl_scratchpad_mode_t get_default_scratchpad_mode() {
-        return has_bench_mode_modifier(mode_modifier_t::par_create)
-                ? dnnl_scratchpad_mode_user
-                : dnnl_scratchpad_mode_library;
-    }
 
     arg_scales_t scales;
     zero_points_t zero_points;
@@ -439,67 +413,8 @@ struct isa_hints_t {
 
 using policy_t = attr_t::policy_t;
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-struct sparse_options_t {
-    static constexpr dnnl_sparse_encoding_t def_encoding
-            = dnnl_sparse_encoding_undef;
-    static constexpr float def_sparsity = 0.9;
-
-    sparse_options_t() = default;
-    sparse_options_t(int arg, dnnl_sparse_encoding_t encoding, float sparsity) {
-        add(arg, encoding, sparsity);
-    }
-
-    void add(int arg, dnnl_sparse_encoding_t encoding, float sparsity) {
-        options_.insert({arg, {encoding, sparsity}});
-    }
-
-    dnnl_sparse_encoding_t get_encoding(int arg) const {
-        if (options_.count(arg) == 0) return dnnl_sparse_encoding_undef;
-        return options_.at(arg).first;
-    }
-
-    float get_sparsity(int arg) const {
-        if (options_.count(arg) == 0) return 0.0f;
-        return options_.at(arg).second;
-    }
-
-    bool is_encoding_def(int arg) const {
-        return get_encoding(arg) == def_encoding;
-    }
-
-    bool is_sparsity_def(int arg) const {
-        return get_sparsity(arg) == def_sparsity;
-    }
-
-    bool is_def() const {
-        bool ret = true;
-        for (const auto &opt : options_) {
-            ret = ret && is_encoding_def(opt.first)
-                    && is_sparsity_def(opt.first);
-        }
-        return ret;
-    }
-
-    std::vector<int> get_args() const {
-        std::vector<int> args;
-        for (const auto &opt : options_) {
-            args.push_back(opt.first);
-        }
-        return args;
-    }
-
-    int from_str(const std::string &s);
-
-private:
-    std::unordered_map<int, std::pair<dnnl_sparse_encoding_t, float>> options_;
-};
-
-std::ostream &operator<<(
-        std::ostream &s, const sparse_options_t &sparse_options);
-#endif
-
 std::ostream &operator<<(std::ostream &s, const policy_t &policy);
+std::ostream &operator<<(std::ostream &s, const attr_t::scale_t &scale);
 std::ostream &operator<<(
         std::ostream &s, const attr_t::zero_points_t &zero_points);
 std::ostream &operator<<(std::ostream &s, const attr_t::arg_scales_t &scales);
@@ -512,6 +427,34 @@ std::ostream &operator<<(std::ostream &s, const attr_t &attr);
 // A container for additional data and info, not available from user's input at
 // parse time, but which are required to create the library attributes.
 struct attr_args_t {
+    struct entry_t {
+        entry_t(const void *vals = NULL, int64_t count = 1, int mask = -1,
+                bool runtime = false)
+            : vals(vals), count(count), mask(mask), runtime(runtime) {}
+
+        bool is_def() const {
+            return vals == NULL && count == 1 && mask == -1 && runtime == false;
+        }
+
+        int64_t get_count(policy_t policy) const {
+            return (policy == policy_t::COMMON || runtime) ? 1 : count;
+        }
+
+        int get_mask(policy_t policy) const {
+            return mask == -1 ? attr_t::get_default_mask(policy) : mask;
+        }
+
+        const float *get_float_ptr() const {
+            return runtime ? &DNNL_RUNTIME_F32_VAL
+                           : static_cast<const float *>(vals);
+        }
+
+        const void *vals = NULL;
+        int64_t count = 1;
+        int mask = -1;
+        bool runtime = false;
+    };
+
     struct dw_t {
         dnnl_data_type_t wei_dt = dnnl_data_type_undef;
         dnnl_data_type_t bia_dt = dnnl_data_type_undef;
@@ -519,20 +462,21 @@ struct attr_args_t {
 
     attr_args_t() = default;
 
-    void prepare_scales(const attr_t &attr, int arg, int mask = -1) {
-        entries.insert(std::make_pair(arg, mask));
-    };
+    void prepare_output_scales(
+            const attr_t &attr, const void *vals, int64_t count, int mask = -1);
+
+    void prepare_scales(const attr_t &attr, int arg, const void *vals,
+            int64_t count, int mask = -1);
 
     int prepare_post_ops_mds(
-            const attr_t &attr, int ndims, const dnnl_dims_t prb_dims);
+            const attr_t &attr, int ndims, const dnnl_dims_t dims);
 
     void prepare_dw_post_op(const attr_t &attr, dnnl_data_type_t wei_dt,
             dnnl_data_type_t bia_dt);
 
-    // Returns mask set for correspondent `arg`. The default value is `-1`.
-    int get_mask(int arg) const {
+    entry_t get(int arg) const {
         const auto it = entries.find(arg);
-        return it == entries.end() ? -1 : it->second;
+        return it == entries.end() ? entry_t() : it->second;
     }
 
     dnnl_memory_desc_t get_md(int arg) const {
@@ -552,7 +496,13 @@ struct attr_args_t {
     }
 
 private:
-    std::map<int, int /* mask*/> entries;
+    void insert(
+            int arg, const void *vals, int64_t count, int mask, bool runtime) {
+        entries.insert(
+                std::make_pair(arg, entry_t(vals, count, mask, runtime)));
+    }
+
+    std::map<int, entry_t> entries;
     std::map<int, benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t>> mds;
     dw_t dw_entry; // only single dw fusion is supported
 };

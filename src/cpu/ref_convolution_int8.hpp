@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -56,8 +56,7 @@ struct ref_convolution_int8_fwd_t : public primitive_t {
                                     | smask_t::zero_points_runtime
                                     | smask_t::post_ops | smask_t::sum_dt,
                             dst_type)
-                    && attr()->post_ops_.check_sum_consistency(dst_type,
-                            /* is_int8 */ true)
+                    && attr()->post_ops_.check_sum_consistent_dt(dst_type)
                     && attr_scales_ok() && zero_points_ok() && post_ops_ok()
                     && attr_.set_default_formats(dst_md(0)) == status::success;
             return ok ? status::success : status::unimplemented;

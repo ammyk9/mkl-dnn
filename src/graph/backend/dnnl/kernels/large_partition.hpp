@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -53,6 +53,7 @@ namespace dnnl_impl {
 
 class larger_partition_kernel_t : public kernel_base_t {
 protected:
+    dnnl::engine p_engine_;
     allocator_t *g_alloc_;
 
     std::shared_ptr<subgraph_t> subgraph_;
@@ -64,26 +65,20 @@ protected:
     constant_cache_t::key_t constant_key_
             = reinterpret_cast<constant_cache_t::key_t>(this);
 
+    bool enable_constant_cache_ = is_constant_cache_enabled();
+
     std::once_flag once_flag_;
     subgraph_visualizer_t vis_;
     pass_pipeline_t pipeline_;
 
 public:
-    larger_partition_kernel_t() {
-        thread_local_cache_t<execution_args_set_t> res_cache;
-        res_cache.retain();
-
-        if (enabled_constant_cache()) get_global_constant_cache().retain();
-    }
-
     ~larger_partition_kernel_t() override {
         thread_local_cache_t<execution_args_set_t> res_cache;
         res_cache.remove_if_exist(reinterpret_cast<size_t>(this));
-        res_cache.release();
 
-        if (enabled_constant_cache()) {
-            get_global_constant_cache().remove_if_exist(constant_key_);
-            get_global_constant_cache().release();
+        if (enable_constant_cache_) {
+            constant_cache_t constant_cache;
+            constant_cache.remove_if_exist(constant_key_);
         }
     }
 
@@ -101,10 +96,10 @@ public:
         // lowered subgraph. We need to improve them.
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_to_int8_concat);
 
-        BACKEND_DNNL_ADD_PASS(pipeline, remove_quant_data_with_no_effect);
         // Fusion and canonicalization passes begin
         BACKEND_DNNL_ADD_PASS(pipeline, lift_up_typecast);
         BACKEND_DNNL_ADD_PASS(pipeline, lift_up_quantize);
+        BACKEND_DNNL_ADD_PASS(pipeline, move_scalar_div_behind_matmul);
 
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_bias_add);
         BACKEND_DNNL_ADD_PASS(pipeline, insert_bn_folding);
@@ -122,6 +117,8 @@ public:
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_to_int8_pool);
 
         BACKEND_DNNL_ADD_PASS(pipeline, combine_binary_post_op_scales);
+
+        BACKEND_DNNL_ADD_PASS(pipeline, fold_mul_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_src_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_src_zero_points);
@@ -131,21 +128,14 @@ public:
 
         BACKEND_DNNL_ADD_PASS(
                 pipeline, insert_unsqueeze_and_squeeze_for_reduction);
-        // bnorm here.
-        BACKEND_DNNL_ADD_PASS(pipeline, swap_relu_mul_scales);
-        BACKEND_DNNL_ADD_PASS(pipeline, fold_pre_mul_scale_into_bn);
-        BACKEND_DNNL_ADD_PASS(pipeline, fold_post_mul_scale_into_bn);
 
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_post_ops);
-        BACKEND_DNNL_ADD_PASS(pipeline, fold_mul_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_dst_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_dst_scales);
         BACKEND_DNNL_ADD_PASS(pipeline, convert_to_runtime_dst_zero_points);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_dst_zero_points);
 
         BACKEND_DNNL_ADD_PASS(pipeline, defer_src_zps_for_pool);
-        BACKEND_DNNL_ADD_PASS(pipeline, remove_quant_data_with_no_effect);
-        BACKEND_DNNL_ADD_PASS(pipeline, fold_sub_zps_add_zps);
         BACKEND_DNNL_ADD_PASS(pipeline, remove_quant_data_with_no_effect);
         BACKEND_DNNL_ADD_PASS(pipeline, replace_quant_data_with_binary_post_op);
 
@@ -156,7 +146,6 @@ public:
         BACKEND_DNNL_ADD_PASS(pipeline, convert_runtime_zero_points);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_dynamic_mul_scales_add_zps);
         BACKEND_DNNL_ADD_PASS(pipeline, fuse_dynamic_sub_zps_mul_scales);
-        BACKEND_DNNL_ADD_PASS(pipeline, convert_dynamic_quantize_ops);
 
         BACKEND_DNNL_ADD_PASS(pipeline, insert_u8_to_s8_for_matmul);
         BACKEND_DNNL_ADD_PASS(pipeline, insert_permute_for_matmul);
@@ -218,8 +207,8 @@ public:
                 g_engine->get_allocator());
 
         // get subgraph from the deep copied partition
-        subgraph_ = std::make_shared<subgraph_t>(part->get_ops(), p_engine_,
-                part->get_fpmath_mode(), part->get_use_blocked_layout(), true);
+        subgraph_ = std::make_shared<subgraph_t>(
+                part->get_ops(), p_engine_, part->get_fpmath_mode(), true);
         BACKEND_DNNL_CHECK(
                 set_given_inputs_outputs(subgraph_, inputs, outputs));
 
@@ -230,8 +219,7 @@ public:
                         return this->memory_planner_.get_memory_info(val);
                     });
             pipeline_ = pass_pipeline_t(vis_);
-            setup_pipeline(
-                    pipeline_, memory_planner_, enabled_constant_cache());
+            setup_pipeline(pipeline_, memory_planner_, enable_constant_cache_);
         });
 
         // Run the added passes
@@ -302,10 +290,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {
@@ -374,10 +363,11 @@ public:
                 "no enough scratchpad memory");
         prepare_args_set(res, inputs, outputs, scratchpad);
 
-        if (enabled_constant_cache()) {
+        if (enable_constant_cache_) {
             std::promise<constant_cache_t::cached_t> c_promise;
+            constant_cache_t global_constant_cache;
             constant_cache_t::value_t cached_value
-                    = get_global_constant_cache().get_or_add(
+                    = global_constant_cache.get_or_add(
                             constant_key_, c_promise.get_future());
             bool is_from_cache = cached_value.valid();
             if (is_from_cache) {

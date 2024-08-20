@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,8 +30,7 @@
 
 namespace compare {
 
-namespace {
-void dump_point_values(const_dnnl_memory_desc_t md, const std::string &kind_str,
+static void dump_point_values(const dnnl_memory_desc_t &md, data_kind_t kind,
         int64_t l_offset, float exp_f32, float exp, float got, float diff,
         float rel_diff) {
     std::stringstream ss;
@@ -40,30 +39,34 @@ void dump_point_values(const_dnnl_memory_desc_t md, const std::string &kind_str,
     ss << dims_idx;
     std::string ind_str = ss.str();
 
+    std::string skind;
+    if (kind != DAT_TOTAL) skind = "[" + std::string(data_kind2str(kind)) + "]";
+
     BENCHDNN_PRINT(0,
             "[%4ld]%s[%s] exp_f32:%12g exp:%12g got:%12g diff:%8g rdiff:%8g\n",
-            (long)l_offset, kind_str.c_str(), ind_str.c_str(), exp_f32, exp,
-            got, diff, rel_diff);
+            (long)l_offset, skind.c_str(), ind_str.c_str(), exp_f32, exp, got,
+            diff, rel_diff);
 }
 
-void dump_norm_values(
-        const diff_norm_t &diff_norm, const std::string &kind_str) {
+static void dump_norm_values(const diff_norm_t &diff_norm, data_kind_t kind) {
+    std::string skind;
+    if (kind != DAT_TOTAL) skind = "[" + std::string(data_kind2str(kind)) + "]";
+
     BENCHDNN_PRINT(0,
             "%s[L0] = %g\n"
             "%s[L1] exp:%8g got:%8g diff:%8g rel_diff:%8g\n"
             "%s[L2] exp:%8g got:%8g diff:%8g rel_diff:%8g\n"
             "%s[L8] exp:%8g got:%8g diff:%8g rel_diff:%8g\n",
-            kind_str.c_str(), diff_norm.rel_diff(norm_t::L0), kind_str.c_str(),
+            skind.c_str(), diff_norm.rel_diff(norm_t::L0), skind.c_str(),
             diff_norm.a_[norm_t::L1], diff_norm.b_[norm_t::L1],
             diff_norm.diff_[norm_t::L1], diff_norm.rel_diff(norm_t::L1),
-            kind_str.c_str(), diff_norm.a_[norm_t::L2],
-            diff_norm.b_[norm_t::L2], diff_norm.diff_[norm_t::L2],
-            diff_norm.rel_diff(norm_t::L2), kind_str.c_str(),
-            diff_norm.a_[norm_t::L8], diff_norm.b_[norm_t::L8],
+            skind.c_str(), diff_norm.a_[norm_t::L2], diff_norm.b_[norm_t::L2],
+            diff_norm.diff_[norm_t::L2], diff_norm.rel_diff(norm_t::L2),
+            skind.c_str(), diff_norm.a_[norm_t::L8], diff_norm.b_[norm_t::L8],
             diff_norm.diff_[norm_t::L8], diff_norm.rel_diff(norm_t::L8));
 }
 
-bool has_binary_comparison_po(const attr_t &attr) {
+static bool has_binary_comparison_po(const attr_t &attr) {
     const auto &po = attr.post_ops;
     if (po.is_def()) return false;
 
@@ -81,38 +84,6 @@ bool has_binary_comparison_po(const attr_t &attr) {
     }
     return false;
 }
-
-bool negative_converts_to_zero(const attr_t &attr, dnnl_data_type_t target_dt) {
-    using po_kind_t = attr_t::post_ops_t::kind_t;
-    const auto &po = attr.post_ops;
-
-    // Check for all post-ops that convert negative to zero
-    std::vector<po_kind_t> non_neg_po {po_kind_t::ABS};
-    std::vector<po_kind_t> non_neg_alpha_0_po {po_kind_t::CLIP,
-            po_kind_t::CLIP_V2, po_kind_t::ELU, po_kind_t::RELU};
-    for (int i = 0; i < po.len(); ++i) {
-        const auto &e = po.entry[i];
-        if (!e.is_eltwise_kind()) continue;
-
-        auto k = e.kind;
-        auto alpha = e.eltwise.alpha;
-
-        if (std::any_of(non_neg_po.cbegin(), non_neg_po.cend(),
-                    [k](const po_kind_t alg) { return alg == k; }))
-            return true;
-
-        if (std::any_of(non_neg_alpha_0_po.cbegin(), non_neg_alpha_0_po.cend(),
-                    [k, alpha](const po_kind_t alg) {
-                        return alg == k && alpha == 0;
-                    }))
-            return true;
-    }
-    // Check for u8 dst
-    if (target_dt == dnnl_u8) return true;
-
-    return false;
-}
-} // namespace
 
 bool compare_extreme_values(float a, float b) {
     if (std::isnan(a) && std::isnan(b)) return true;
@@ -166,8 +137,8 @@ int compare_t::compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         }
 
         if (need_dump)
-            dump_point_values(got_mem.md_, get_kind_str(), i, args.exp_f32,
-                    args.exp, args.got, args.diff, args.rel_diff);
+            dump_point_values(got_mem.md_, kind_, i, args.exp_f32, args.exp,
+                    args.got, args.diff, args.rel_diff);
     }
     diff_norm.done();
 
@@ -175,7 +146,7 @@ int compare_t::compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     if (!ok) res->errors = 1;
 
     const bool dump = need_dump || !ok;
-    if (dump) dump_norm_values(diff_norm, get_kind_str());
+    if (dump) dump_norm_values(diff_norm, kind_);
 
     if (res->errors) res->state = FAILED;
     if (res->state == EXECUTED) res->state = PASSED;
@@ -195,11 +166,7 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
 
     dnn_mem_t got_f32(got_mem, dnnl_f32, tag::abx, get_cpu_engine());
     const auto dt = got_mem.dt();
-    const bool has_eltwise
-            = attr.post_ops.eltwise_index() != -1 || has_eltwise_post_op_;
-    const bool output_has_nans = op_output_has_nans_
-            || eltwise::eltwise_alg_returns_nan_or_inf(attr)
-            || got_mem.dt() == dnnl_f16;
+    const bool has_eltwise = attr.post_ops.eltwise_index() != -1;
     const bool has_exp_eltwise
             = attr.post_ops.find(attr_t::post_ops_t::kind_t::EXP) >= 0;
     const bool has_dst_scale = !attr.scales.get(DNNL_ARG_DST).is_def();
@@ -224,10 +191,8 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         if (!ok) {
             // Standard check for relative diff is under set threshold...
             ok = (fabsf(args.exp) > 1e-5f ? args.rel_diff : args.diff) <= trh_;
-            // If not, when NaNs or infinity are allowed for the driver, check
-            // that both exp and got are NaNs or infinity with same sign...
-            if (!ok && output_has_nans)
-                ok = compare::compare_extreme_values(args.exp, args.got);
+            // If not, check that both are NaNs or infinity with same sign...
+            if (!ok) ok = compare::compare_extreme_values(args.exp, args.got);
             // If not, use hack to check not fully correct s32 saturation on
             // cpu...
             if (!ok && is_cpu() && dt == dnnl_s32
@@ -268,7 +233,7 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             // different results for different backends when NaN is one of
             // inputs. Depending on its position and implementation, either
             // first or second operand may be returned.
-            if (!ok && has_binary_comparison_po(attr) && output_has_nans)
+            if (!ok && has_binary_comparison_po(attr) && op_output_has_nans_)
                 ok = true;
             // Some drivers (like pooling or resampling) on integer data types
             // may result in sporadic order of operations. This may cause a
@@ -298,8 +263,8 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         const bool dump
                 = need_dump || (!ok && (n_errors < 10 || verbose >= 10));
         if (!from_parallel && dump)
-            dump_point_values(got_mem.md_, get_kind_str(), i, args.exp_f32,
-                    args.exp, args.got, args.diff, args.rel_diff);
+            dump_point_values(got_mem.md_, kind_, i, args.exp_f32, args.exp,
+                    args.got, args.diff, args.rel_diff);
     };
 
     // parallel comparison to speed up the process
@@ -315,24 +280,20 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     // Set state to FAILED in case of any errors.
     if (n_errors) res->errors = n_errors, res->state = FAILED;
     // State could be already FAILED, check zero trust for non-FAILED only.
-    const float zeros_percent = 100.f * zeros / nelems;
-    float zero_trust_percent = zero_trust_percent_;
-    // Adjust default zero trust for cases when negative are converted into 0.
-    if (zero_trust_percent_ == default_zero_trust_percent_
-            && negative_converts_to_zero(attr, dt)) {
-        // (100% - X%) / 2 + X%. X% is default. Each half represents positive
-        // and negative in the output equally.
-        zero_trust_percent = (100.f + zero_trust_percent_) / 2.f;
+    if (res->state != FAILED) {
+        const auto zeros_percent = 100.f * zeros / nelems;
+        if (nelems >= 10 && zeros_percent > zero_trust_percent_) {
+            res->state = MISTRUSTED;
+            std::string skind;
+            if (kind_ != DAT_TOTAL)
+                skind = "[" + std::string(data_kind2str(kind_)) + "]";
+            BENCHDNN_PRINT(2,
+                    "No trust stats [%s]: z:%2.0f%% (>%2.0f%%) (z: %ld, "
+                    "total: %ld)\n",
+                    skind.c_str(), zeros_percent, zero_trust_percent_,
+                    (long)zeros.load(), (long)nelems);
+        }
     }
-    if (res->state != FAILED && zeros_percent > zero_trust_percent
-            && nelems >= 10)
-        res->state = MISTRUSTED;
-
-    BENCHDNN_PRINT((res->state == MISTRUSTED ? 2 : 6),
-            "[TRUST_STATS]%s: z:%2.0f%% (>%2.0f%%) (z: %ld, total: %ld)\n",
-            get_kind_str().c_str(), zeros_percent, zero_trust_percent,
-            (long)zeros.load(), (long)nelems);
-
     // Set PASSED if no failure in current or previous checks happened and test
     // can be trusted.
     if (res->state == EXECUTED) res->state = PASSED;
@@ -342,11 +303,6 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
 
 int compare_t::compare(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         const attr_t &attr, res_t *res) const {
-    std::string add_args = std::string(use_norm_ ? "use_norm:true" : "")
-            + std::string(op_output_has_nans_ ? "has_nans:true" : "");
-    BENCHDNN_PRINT(6, "[COMPARE]%s: trh=%g zero_trust%%=%.2f%% extra=%s\n",
-            get_kind_str().c_str(), trh_, zero_trust_percent_,
-            add_args.c_str());
     if (use_norm_) return compare_norm(exp_mem, got_mem, attr, res);
     return compare_p2p(exp_mem, got_mem, attr, res);
 }

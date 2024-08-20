@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,27 +16,16 @@
 
 #include <string.h>
 
+#include <sstream>
+
 #include "dnnl_common.hpp"
 #include "utils/parser.hpp"
-#include "utils/task_executor.hpp"
 
 #include "reorder.hpp"
 
 namespace reorder {
 
-using create_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using check_cache_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, res_t *)>;
-using do_func_t = std::function<int(
-        const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &,
-        const prb_t *, res_t *)>;
-using driver_task_executor_t = task_executor_t<prb_t, perf_report_t,
-        create_func_t, check_cache_func_t, do_func_t>;
-
-void check_correctness(
-        const settings_t &s, driver_task_executor_t &task_executor) {
+void check_correctness(const settings_t &s) {
     for_(const auto &i_sdt : s.sdt)
     for_(const auto &i_ddt : s.ddt)
     for_(const auto &i_stag : s.stag)
@@ -62,20 +51,31 @@ void check_correctness(
         for_(const auto &i_src_test_scale : src_test_scales)
         for (const auto &i_dst_test_scale : dst_test_scales) {
             attr_t::arg_scales_t test_arg_scales;
-            test_arg_scales.set(
-                    DNNL_ARG_SRC, {src_scale.policy, i_src_test_scale});
-            test_arg_scales.set(
-                    DNNL_ARG_DST, {dst_scale.policy, i_dst_test_scale});
+            test_arg_scales.set(DNNL_ARG_SRC,
+                    {src_scale.policy, i_src_test_scale, src_scale.runtime});
+            test_arg_scales.set(DNNL_ARG_DST,
+                    {dst_scale.policy, i_dst_test_scale, dst_scale.runtime});
             auto attr = settings_t::get_attr(test_arg_scales, i_zero_points,
                     i_post_ops, i_scratchpad_mode);
 
             const prb_t prb(s.prb_dims, i_sdt, i_ddt, i_stag, i_dtag, attr,
                     i_ctx_init, i_ctx_exe, i_oflag, i_cross_engine,
                     i_runtime_dim_mask);
-            if (s.pattern && !match_regex(prb.str(), s.pattern)) return;
+            std::stringstream ss;
+            ss << prb;
+            const std::string cpp_pstr = ss.str();
+            const char *pstr = cpp_pstr.c_str();
+            BENCHDNN_PRINT(1, "run: %s\n", pstr);
 
-            task_executor.submit(
-                    prb, s.perf_template, createit, check_cacheit, doit);
+            res_t res {};
+            doit(&prb, &res);
+
+            parse_result(res, pstr);
+
+            if (is_bench_mode(PERF)) {
+                perf_report_t pr(&prb, s.perf_template);
+                pr.report(&res, pstr);
+            }
         }
     }
 }
@@ -129,7 +129,6 @@ int bench(int argc, char **argv) {
     using namespace parser;
     static settings_t s;
     static const settings_t def {};
-    driver_task_executor_t task_executor;
     for (; argc > 0; --argc, ++argv) {
         const bool parsed_options = parse_bench_settings(argv[0])
                 || parse_batch(bench, argv[0])
@@ -154,7 +153,6 @@ int bench(int argc, char **argv) {
                         s.scratchpad_mode, def.scratchpad_mode, argv[0])
                 || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
                 || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
-                || parse_test_pattern_match(s.pattern, argv[0])
                 || parse_perf_template(s.perf_template, s.perf_template_def,
                         s.perf_template_csv(), argv[0])
                 || parse_reset(s, argv[0]) || parse_help(argv[0]);
@@ -164,11 +162,9 @@ int bench(int argc, char **argv) {
             parse_prb_dims(s.prb_dims, argv[0]);
 
             SAFE(verify_input(s), WARN);
-            check_correctness(s, task_executor);
+            check_correctness(s);
         }
     }
-
-    task_executor.flush();
 
     return parse_last_argument();
 }

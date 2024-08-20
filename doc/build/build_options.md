@@ -3,34 +3,33 @@ Build Options {#dev_guide_build_options}
 
 oneDNN supports the following build-time options.
 
-| CMake Option                    | Supported values (defaults in bold)        | Description                                                                                     |
-|:--------------------------------|:-------------------------------------------|:------------------------------------------------------------------------------------------------|
-| ONEDNN_LIBRARY_TYPE             | **SHARED**, STATIC                         | Defines the resulting library type                                                              |
-| ONEDNN_CPU_RUNTIME              | NONE, **OMP**, TBB, SEQ, THREADPOOL, SYCL  | Defines the threading runtime for CPU engines                                                   |
-| ONEDNN_GPU_RUNTIME              | **NONE**, OCL, SYCL                        | Defines the offload runtime for GPU engines                                                     |
-| ONEDNN_BUILD_EXAMPLES           | **ON**, OFF                                | Controls building the examples                                                                  |
-| ONEDNN_BUILD_TESTS              | **ON**, OFF                                | Controls building the tests                                                                     |
-| ONEDNN_BUILD_GRAPH              | **ON**, OFF                                | Controls building graph component                                                               |
-| ONEDNN_ENABLE_GRAPH_DUMP        | ON, **OFF**                                | Controls dumping graph artifacts                                                                |
-| ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_BACKEND | ON, **OFF**                     | Enables the [graph compiler backend](@ref dev_guide_graph_compiler) of the graph component (experimental)|
-| ONEDNN_ARCH_OPT_FLAGS           | *compiler flags*                           | Specifies compiler optimization flags (see warning note below)                                  |
-| ONEDNN_ENABLE_CONCURRENT_EXEC   | ON, **OFF**                                | Disables sharing a common scratchpad between primitives in #dnnl::scratchpad_mode::library mode |
-| ONEDNN_ENABLE_JIT_PROFILING     | **ON**, OFF                                | Enables [integration with performance profilers](@ref dev_guide_profilers)                      |
-| ONEDNN_ENABLE_ITT_TASKS         | **ON**, OFF                                | Enables [integration with performance profilers](@ref dev_guide_profilers)                      |
-| ONEDNN_ENABLE_PRIMITIVE_CACHE   | **ON**, OFF                                | Enables [primitive cache](@ref dev_guide_primitive_cache)                                       |
-| ONEDNN_ENABLE_MAX_CPU_ISA       | **ON**, OFF                                | Enables [CPU dispatcher controls](@ref dev_guide_cpu_dispatcher_control)                        |
-| ONEDNN_ENABLE_CPU_ISA_HINTS     | **ON**, OFF                                | Enables [CPU ISA hints](@ref dev_guide_cpu_isa_hints)                                           |
-| ONEDNN_ENABLE_WORKLOAD          | **TRAINING**, INFERENCE                    | Specifies a set of functionality to be available based on workload                              |
-| ONEDNN_ENABLE_PRIMITIVE         | **ALL**, PRIMITIVE_NAME                    | Specifies a set of functionality to be available based on primitives                            |
-| ONEDNN_ENABLE_PRIMITIVE_CPU_ISA | **ALL**, CPU_ISA_NAME                      | Specifies a set of functionality to be available for CPU backend based on CPU ISA               |
-| ONEDNN_ENABLE_PRIMITIVE_GPU_ISA | **ALL**, GPU_ISA_NAME                      | Specifies a set of functionality to be available for GPU backend based on GPU ISA               |
-| ONEDNN_EXPERIMENTAL             | ON, **OFF**                                | Enables [experimental features](@ref dev_guide_experimental)                                    |
-| ONEDNN_VERBOSE                  | **ON**, OFF                                | Enables [verbose mode](@ref dev_guide_verbose)                                                  |
-| ONEDNN_AARCH64_USE_ACL          | ON, **OFF**                                | Enables integration with Arm Compute Library for AArch64 builds                                 |
-| ONEDNN_BLAS_VENDOR              | **NONE**, ARMPL                            | Defines an external BLAS library to link to for GEMM-like operations                            |
-| ONEDNN_GPU_VENDOR               | **INTEL**, NVIDIA                          | Defines GPU vendor for GPU engines                                                              |
-| ONEDNN_DPCPP_HOST_COMPILER      | **DEFAULT**, *GNU C++ compiler executable* | Specifies host compiler executable for SYCL runtime                                             |
-| ONEDNN_LIBRARY_NAME             | **dnnl**, *library name*                   | Specifies name of the library                                                                   |
+| CMake Option                    | Supported values (defaults in bold)        | Description
+| :---                            | :---                                       | :---
+| ONEDNN_LIBRARY_TYPE             | **SHARED**, STATIC                         | Defines the resulting library type
+| ONEDNN_CPU_RUNTIME              | NONE, **OMP**, TBB, SEQ, THREADPOOL, SYCL  | Defines the threading runtime for CPU engines
+| ONEDNN_GPU_RUNTIME              | **NONE**, OCL, SYCL                        | Defines the offload runtime for GPU engines
+| ONEDNN_BUILD_EXAMPLES           | **ON**, OFF                                | Controls building the examples
+| ONEDNN_BUILD_TESTS              | **ON**, OFF                                | Controls building the tests
+| ONEDNN_BUILD_GRAPH              | ON, **OFF**                                | Controls building graph component (experimental)
+| ONEDNN_ENABLE_GRAPH_DUMP        | ON, **OFF**                                | Controls dumping graph artifacts
+| ONEDNN_ARCH_OPT_FLAGS           | *compiler flags*                           | Specifies compiler optimization flags (see warning note below)
+| ONEDNN_ENABLE_CONCURRENT_EXEC   | ON, **OFF**                                | Disables sharing a common scratchpad between primitives in #dnnl::scratchpad_mode::library mode
+| ONEDNN_ENABLE_JIT_PROFILING     | **ON**, OFF                                | Enables [integration with performance profilers](@ref dev_guide_profilers)
+| ONEDNN_ENABLE_ITT_TASKS         | **ON**, OFF                                | Enables [integration with performance profilers](@ref dev_guide_profilers)
+| ONEDNN_ENABLE_PRIMITIVE_CACHE   | **ON**, OFF                                | Enables [primitive cache](@ref dev_guide_primitive_cache)
+| ONEDNN_ENABLE_MAX_CPU_ISA       | **ON**, OFF                                | Enables [CPU dispatcher controls](@ref dev_guide_cpu_dispatcher_control)
+| ONEDNN_ENABLE_CPU_ISA_HINTS     | **ON**, OFF                                | Enables [CPU ISA hints](@ref dev_guide_cpu_isa_hints)
+| ONEDNN_ENABLE_WORKLOAD          | **TRAINING**, INFERENCE                    | Specifies a set of functionality to be available based on workload
+| ONEDNN_ENABLE_PRIMITIVE         | **ALL**, PRIMITIVE_NAME                    | Specifies a set of functionality to be available based on primitives
+| ONEDNN_ENABLE_PRIMITIVE_CPU_ISA | **ALL**, CPU_ISA_NAME                      | Specifies a set of functionality to be available for CPU backend based on CPU ISA
+| ONEDNN_ENABLE_PRIMITIVE_GPU_ISA | **ALL**, GPU_ISA_NAME                      | Specifies a set of functionality to be available for GPU backend based on GPU ISA
+| ONEDNN_EXPERIMENTAL             | ON, **OFF**                                | Enables [experimental features](@ref dev_guide_experimental)
+| ONEDNN_VERBOSE                  | **ON**, OFF                                | Enables [verbose mode](@ref dev_guide_verbose)
+| ONEDNN_AARCH64_USE_ACL          | ON, **OFF**                                | Enables integration with Arm Compute Library for AArch64 builds
+| ONEDNN_BLAS_VENDOR              | **NONE**, ARMPL                            | Defines an external BLAS library to link to for GEMM-like operations
+| ONEDNN_GPU_VENDOR               | **INTEL**, NVIDIA                          | Defines GPU vendor for GPU engines
+| ONEDNN_DPCPP_HOST_COMPILER      | **DEFAULT**, *GNU C++ compiler executable* | Specifies host compiler executable for DPCPP runtimes
+| ONEDNN_LIBRARY_NAME             | **dnnl**, *library name*                   | Specifies name of the library
 
 All building options listed support their counterparts with `DNNL` prefix
 instead of `ONEDNN`. `DNNL` options would take precedence over `ONEDNN`
@@ -220,10 +219,10 @@ By default, AArch64 builds will use the reference implementations throughout.
 The following options enable the use of AArch64 optimised implementations
 for a limited number of operations, provided by AArch64 libraries.
 
-| AArch64 build configuration          | CMake Option              | Environment variables                    | Dependencies                                                                                                                 |
-|:-------------------------------------|:--------------------------|:-----------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------|
-| Arm Compute Library based primitives | ONEDNN_AARCH64_USE_ACL=ON | ACL_ROOT_DIR=*</path/to/ComputeLibrary>* | [Arm Compute Library](https://github.com/ARM-software/ComputeLibrary)                                                        |
-| Vendor BLAS library support          | ONEDNN_BLAS_VENDOR=ARMPL  | None                                     | [Arm Performance Libraries](https://developer.arm.com/tools-and-software/server-and-hpc/downloads/arm-performance-libraries) |
+| AArch64 build configuration           | CMake Option              | Environment variables                    | Dependencies
+| :---                                  | :---                      | :---                                     | :---
+| Arm Compute Library based primitives  | ONEDNN_AARCH64_USE_ACL=ON | ACL_ROOT_DIR=*</path/to/ComputeLibrary>* | [Arm Compute Library](https://github.com/ARM-software/ComputeLibrary)
+| Vendor BLAS library support           | ONEDNN_BLAS_VENDOR=ARMPL  | None                                     | [Arm Performance Libraries](https://developer.arm.com/tools-and-software/server-and-hpc/downloads/arm-performance-libraries)
 
 #### Arm Compute Library
 Arm Compute Library is an open-source library for machine learning applications.
@@ -245,7 +244,7 @@ For a debug build of oneDNN it is advisable to specify a Compute Library build
 which has also been built with debug enabled.
 
 @warning
-oneDNN only supports builds with Compute Library v23.02.1 or later.
+oneDNN only supports builds with Compute Library v22.08 or later.
 
 #### Vendor BLAS libraries
 oneDNN can use a standard BLAS library for GEMM operations.
@@ -279,34 +278,16 @@ explicitly specify the path to the SDK using `-DOPENCLROOT` CMake option.
 $ cmake -DONEDNN_GPU_RUNTIME=OCL -DOPENCLROOT=/path/to/opencl/sdk ..
 ~~~
 
-@anchor component_limitation
 ## Graph component limitations
 
 The graph component can be enabled via the build option `ONEDNN_BUILD_GRAPH`.
 But the build option does not work with some values of other build options.
-Specifying the options and values simultaneously in one build will lead to a
-CMake error.
+Specifying the options and values simutanously in one build will lead to a CMake
+error.
 
-| CMake Option            | Unsupported Values |
-|:------------------------|:-------------------|
-| ONEDNN_GPU_RUNTIME      | OCL                |
-| ONEDNN_GPU_VENDOR       | NVIDIA             |
-| ONEDNN_ENABLE_PRIMITIVE | PRIMITIVE_NAME     |
-| ONEDNN_ENABLE_WORKLOAD  | INFERENCE          |
-
-## Graph Compiler Backend Limitations
-
-As a backend of the graph component, besides the options described in
-[Graph component limitations](@ref component_limitation), graph compiler
-backend has some extra limitations. Specifying unsupported build options will
-lead to a CMake error.
-
-| CMake Option            | Unsupported Values |
-| :-----------------------| :------------------|
-| ONEDNN_CPU_RUNTIME      | THREADPOOL, SYCL   |
-| ONEDNN_GPU_RUNTIME      | OCL, SYCL          |
-
-Besides, the instructions contained in the kernels generated by the graph
-compiler backend are [AVX512_CORE](@ref dev_guide_cpu_dispatcher_control) or
-above, so these kernels will not be dispatched on systems that do not have
-corresponding instruction sets support.
+| CMake Option            | Value
+| :---                    | :---
+| ONEDNN_GPU_RUNTIME      | OCL
+| ONEDNN_GPU_VENDOR       | NVIDIA
+| ONEDNN_ENABLE_PRIMITIVE | PRIMITIVE_NAME
+| ONEDNN_ENABLE_WORKLOAD  | INFERENCE

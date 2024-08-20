@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@
 #include "src/common/math_utils.hpp"
 
 #include "common.hpp"
-#include "conv/conv_dw_fusion.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_debug.hpp"
@@ -111,7 +110,6 @@ const char *data_kind2str(data_kind_t kind) {
         case WEI: return "WEI";
         case BIA: return "BIA";
         case DST: return "DST";
-        case DIFF_DST: return "DIFF_DST";
         case ACC: return "ACC";
         case MEAN: return "MEAN";
         case VAR: return "VAR";
@@ -135,8 +133,6 @@ static const std::map<int, std::vector<const char *>> supported_args {
         {DNNL_ARG_SRC_1, {"src1"}},
         {DNNL_ARG_WEIGHTS, {"wei"}},
         {DNNL_ARG_DST, {"dst"}},
-        {DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST, {"attr_post_op_dw_dst"}},
-        {DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, {"attr_post_op_dw_wei"}},
 };
 
 static int str2arg(const std::string &str) {
@@ -144,14 +140,8 @@ static int str2arg(const std::string &str) {
         for (const auto &s : arg.second)
             if (str.compare(s) == 0) return arg.first;
     // multiple srcs
-    std::string msrc = "msrc";
-    if (str.compare(0, msrc.size(), msrc) == 0) {
-        const auto &str_index = str.substr(msrc.size());
-        if (str_index.empty() /* TODO: || non-digit string */) {
-            BENCHDNN_PRINT(0, "%s\n",
-                    "Error: \'msrc\' argument requires index to be specified.");
-            return BENCHDNN_DNNL_ARG_UNDEF;
-        }
+    if (str.compare(0, 3, "msrc")) {
+        const auto &str_index = str.substr(4);
         const auto index = stoul(str_index);
         return DNNL_ARG_MULTIPLE_SRC + index;
     }
@@ -208,10 +198,12 @@ const char *attr_t::policy2str(policy_t policy) {
     return "unknown attr_t::policy_t policy";
 }
 
-int attr_t::get_default_mask(policy_t policy) {
+int attr_t::get_default_mask(policy_t policy, int arg) {
     switch (policy) {
         case PER_DIM_0: return (1 << 0);
         case PER_OC:
+            if (arg == DNNL_ARG_WEIGHTS) return get_default_mask(PER_DIM_0);
+
         case PER_DIM_1: return (1 << 1);
         case PER_DIM_01: return (1 << 0) + (1 << 1);
         case PER_DIM_2: return (1 << 2);
@@ -225,10 +217,9 @@ int attr_t::get_default_mask(policy_t policy) {
     }
 }
 
-// This function takes input string, extracts float value and asteriks, if
-// present, from the string. Updates @value with extracted values.
-// TODO: remove asteriks from all inputs and update doc.
-int parse_value_and_runtime(float &value, const std::string &s) {
+// This function takes input string, extracts float value and runtime, if
+// present, from the string. Updates @value and @runtime with extracted values.
+int parse_value_and_runtime(float &value, bool &runtime, const std::string &s) {
     // process value
     size_t scale_pos = 0;
     try {
@@ -240,48 +231,16 @@ int parse_value_and_runtime(float &value, const std::string &s) {
                 "Expected input: \'VAL[*]\'. See help for proper syntax.");
         exit(1);
     }
+    runtime = false;
     if (scale_pos + 1 < s.size()) return FAIL;
     if (scale_pos == s.size()) return OK;
     if (s.back() != '*') return FAIL;
+    runtime = true;
     return OK;
 }
 
-int attr_t::arg_scales_t::entry_t::policy2mask(
-        int arg, dnnl_primitive_kind_t prim_kind, bool has_groups) const {
-    const auto policy = this->policy;
-
-    if (arg != DNNL_ARG_WEIGHTS || policy == policy_t::COMMON)
-        return attr_t::get_default_mask(policy);
-
-    // Handle of weights mask for various primitives.
-    if (prim_kind == dnnl_convolution || prim_kind == dnnl_deconvolution
-            || prim_kind == dnnl_inner_product) {
-        switch (policy) {
-            case PER_OC:
-                if (has_groups)
-                    return attr_t::get_default_mask(PER_DIM_01);
-                else
-                    return attr_t::get_default_mask(PER_DIM_0);
-            default: SAFE(FAIL, CRIT); return -1;
-        }
-    } else if (prim_kind == dnnl_matmul) {
-        switch (policy) {
-            // TODO: add batch dimension?
-            case PER_OC: return attr_t::get_default_mask(PER_DIM_1);
-            default: SAFE(FAIL, CRIT); return -1;
-        }
-    } else {
-        assert(prim_kind == dnnl_undefined_primitive);
-        assert(!"Weights may have specific mask for a given primitive. "
-                "Please re-direct new primitive to one of two branches "
-                "above");
-        SAFE(FAIL, CRIT);
-        return -1;
-    }
-}
-
-int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
-    *this = arg_scales_t::entry_t();
+int attr_t::scale_t::from_str(const std::string &s) {
+    *this = scale_t();
     if (s.empty()) return OK;
 
     size_t start_pos = 0;
@@ -291,8 +250,8 @@ int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
     if (start_pos == std::string::npos) return OK;
     if (start_pos >= s.size()) return FAIL; // to catch dangling ':'
 
-    SAFE(parse_value_and_runtime(
-                 this->scale, parser::get_substr(s, start_pos, ':')),
+    SAFE(parse_value_and_runtime(this->scale, this->runtime,
+                 parser::get_substr(s, start_pos, ':')),
             WARN);
     if (this->scale < 0) return FAIL;
     return OK;
@@ -309,12 +268,8 @@ int attr_t::zero_points_t::from_str(const std::string &s) {
 
         auto arg = str2arg(parser::get_substr(subs, subs_pos, ':'));
         if (arg == BENCHDNN_DNNL_ARG_UNDEF || subs_pos == std::string::npos
-                || subs_pos >= subs.size()) {
-            BENCHDNN_PRINT(0,
-                    "Error: argument name \'%s\' was not recognized.\n",
-                    subs.c_str());
+                || subs_pos >= subs.size())
             return FAIL;
-        }
 
         auto policy = str2policy(parser::get_substr(subs, subs_pos, ':'));
         if (policy == POLICY_TOTAL || subs_pos == std::string::npos
@@ -322,10 +277,11 @@ int attr_t::zero_points_t::from_str(const std::string &s) {
             return FAIL;
 
         float zp = 0;
+        bool runtime = false;
         SAFE(parse_value_and_runtime(
-                     zp, parser::get_substr(subs, subs_pos, '\0')),
+                     zp, runtime, parser::get_substr(subs, subs_pos, '\0')),
                 WARN);
-        set(arg, policy, static_cast<int>(zp));
+        set(arg, policy, static_cast<int>(zp), runtime);
     }
     return OK;
 }
@@ -346,14 +302,10 @@ int attr_t::arg_scales_t::from_str(const std::string &s) {
 
         auto arg = str2arg(parser::get_substr(subs, subs_pos, ':'));
         if (arg == BENCHDNN_DNNL_ARG_UNDEF || subs_pos == std::string::npos
-                || subs_pos >= s.size()) {
-            BENCHDNN_PRINT(0,
-                    "Error: argument name \'%s\' was not recognized.\n",
-                    subs.c_str());
+                || subs_pos >= s.size())
             return FAIL;
-        }
 
-        arg_scales_t::entry_t arg_scale;
+        scale_t arg_scale;
         SAFE(arg_scale.from_str(parser::get_substr(subs, subs_pos, '\0')),
                 WARN);
         set(arg, arg_scale);
@@ -604,7 +556,7 @@ int attr_t::post_ops_t::from_str(const std::string &s) {
 
 bool attr_t::is_def(bool skip_fpmath) const {
     return scales.is_def() && zero_points.is_def() && post_ops.is_def()
-            && scratchpad_mode == get_default_scratchpad_mode()
+            && scratchpad_mode == dnnl_scratchpad_mode_library
             && IMPLICATION(
                     !skip_fpmath, fpmath_mode == dnnl_fpmath_mode_strict);
 }
@@ -666,21 +618,20 @@ std::ostream &operator<<(std::ostream &s, const policy_t &policy) {
     return s;
 }
 
-std::ostream &operator<<(
-        std::ostream &s, const attr_t::arg_scales_t::entry_t &scale) {
-    // TODO: remove '*'
-    s << scale.policy << ":" << scale.scale << '*';
+std::ostream &operator<<(std::ostream &s, const attr_t::scale_t &scale) {
+    s << scale.policy << ":" << scale.scale;
+    if (scale.runtime) s << '*';
     return s;
 }
 
 std::ostream &operator<<(
         std::ostream &s, const attr_t::zero_points_t &zero_points) {
     const char *delim = "";
-    // TODO: remove '*'
     for (const auto &point : zero_points.points) {
         s << delim;
         s << arg2str(point.first) << ":" << point.second.policy << ":"
-          << point.second.value << '*';
+          << point.second.value;
+        if (point.second.runtime) s << '*';
         delim = "+";
     }
 
@@ -737,9 +688,11 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                 s << ":" << e.eltwise.alpha;
         } else if (e.is_binary_kind()) {
             s << ":" << e.binary.src1_dt;
-            if (e.binary.policy != policy_t::COMMON || e.binary.tag != tag::any)
+            if (e.binary.policy != policy_t::COMMON) {
                 s << ":" << e.binary.policy;
-            if (e.binary.tag != tag::any) s << ":" << e.binary.tag;
+                if (attr_t::get_default_mask(e.binary.policy) >= 4)
+                    s << ":" << e.binary.tag;
+            }
         } else if (e.is_prelu_kind()) {
             if (e.prelu.policy != policy_t::COMMON) {
                 s << ":" << e.prelu.policy;
@@ -770,7 +723,7 @@ std::ostream &operator<<(std::ostream &s, const attr_t &attr) {
             s << "--attr-zero-points=" << attr.zero_points << " ";
         if (!attr.post_ops.is_def())
             s << "--attr-post-ops=" << attr.post_ops << " ";
-        if (attr.scratchpad_mode != attr_t::get_default_scratchpad_mode())
+        if (attr.scratchpad_mode != dnnl_scratchpad_mode_library)
             s << "--attr-scratchpad=" << attr.scratchpad_mode << " ";
         if (attr.fpmath_mode != dnnl_fpmath_mode_strict)
             s << "--attr-fpmath=" << attr.fpmath_mode << " ";
@@ -778,35 +731,15 @@ std::ostream &operator<<(std::ostream &s, const attr_t &attr) {
     return s;
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-std::ostream &operator<<(std::ostream &s, dnnl_sparse_encoding_t se) {
-    s << sparse_encoding2str(se);
+std::ostream &operator<<(std::ostream &s, bench_mode_t mode) {
+    if (is_bench_mode(RUN) && !(is_bench_mode(CORR) || is_bench_mode(PERF)))
+        s << "R";
+    if (is_bench_mode(CORR)) s << "C";
+    if (is_bench_mode(PERF)) s << "P";
+    if (is_bench_mode(LIST)) s << "L";
+    if (is_bench_mode(PROF)) s << "O";
     return s;
 }
-
-std::ostream &operator<<(
-        std::ostream &s, const sparse_options_t &sparse_options) {
-    if (!sparse_options.is_def()) {
-        s << "--encoding=";
-        const std::vector<int> args
-                = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
-
-        for (int i = 0; i < (int)args.size(); i++) {
-            const int arg = args[i];
-            if (!sparse_options.is_encoding_def(arg)) {
-                s << sparse_options.get_encoding(arg);
-                if (!sparse_options.is_sparsity_def(arg))
-                    s << "+" << sparse_options.get_sparsity(arg);
-            }
-            if (i != (int)args.size() - 1)
-                s << ":";
-            else
-                s << " ";
-        }
-    }
-    return s;
-}
-#endif
 
 std::ostream &operator<<(std::ostream &s, memory_kind_ext_t memory_kind) {
     switch (memory_kind) {
@@ -820,23 +753,6 @@ std::ostream &operator<<(std::ostream &s, memory_kind_ext_t memory_kind) {
 }
 
 std::ostream &dump_global_params(std::ostream &s) {
-    // Need to dump mode and modifiers in front of the driver name to make all
-    // updated default values take effect before parsing a state of a problem.
-    if (canonical || bench_mode != default_bench_mode)
-        s << "--mode=" << bench_mode << " ";
-    // Don't dump modifiers if F mode is used to keep the repro simple.
-    if (canonical
-            || (bench_mode != bench_mode_t::perf_fast
-                    && bench_mode_modifier != default_bench_mode_modifier))
-        s << "--mode-modifier=" << bench_mode_modifier << " ";
-    // Don't dump max_ms_per_prb if F mode is used to keep the repro simple.
-    if (canonical
-            || (bench_mode != bench_mode_t::perf_fast
-                    && max_ms_per_prb != default_max_ms_per_prb))
-        s << "--max-ms-per-prb=" << max_ms_per_prb << " ";
-    if (canonical || fix_times_per_prb != default_fix_times_per_prb)
-        s << "--fix-times-per-prb=" << fix_times_per_prb << " ";
-
     s << "--" << driver_name << " ";
     if (canonical) s << "--canonical=" << bool2str(canonical) << " ";
     if (canonical || engine_tgt_kind != dnnl_cpu) {
@@ -853,6 +769,7 @@ std::ostream &dump_global_params(std::ostream &s) {
         s << "--allow-enum-tags-only=" << bool2str(allow_enum_tags_only) << " ";
     if (canonical || hints.get() != isa_hints_t::none)
         s << "--cpu-isa-hints=" << isa_hints_t::hints2str(hints) << " ";
+    if (canonical || bench_mode != CORR) s << "--mode=" << bench_mode << " ";
     if (canonical || attr_same_pd_check != false)
         s << "--attr-same-pd-check=" << bool2str(attr_same_pd_check) << " ";
 #if defined(DNNL_WITH_SYCL) || DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
@@ -884,7 +801,7 @@ dnnl_scratchpad_mode_t str2scratchpad_mode(const char *str) {
         return dnnl_scratchpad_mode_user;
 
     assert(!"not expected");
-    return attr_t::get_default_scratchpad_mode();
+    return dnnl_scratchpad_mode_library;
 }
 
 dnnl_fpmath_mode_t str2fpmath_mode(const char *str) {
@@ -912,6 +829,11 @@ dnnl_fpmath_mode_t str2fpmath_mode(const char *str) {
 #undef CASE
 }
 
+void attr_args_t::prepare_scales(const attr_t &attr, int arg, const void *vals,
+        int64_t count, int mask) {
+    insert(arg, vals, count, mask, attr.scales.get(arg).runtime);
+}
+
 struct post_ops_rhs_tensor_entry_t {
     dnnl_data_type_t dt;
     policy_t policy;
@@ -937,11 +859,8 @@ post_ops_rhs_tensor_entry_t get_po_rhs_tensor_entry(
 } // namespace
 
 int attr_args_t::prepare_post_ops_mds(
-        const attr_t &attr, int ndims, const dnnl_dims_t prb_dims) {
+        const attr_t &attr, int ndims, const dnnl_dims_t dims) {
     const auto &po = attr.post_ops;
-    dnnl_dims_t dims;
-    for (int d = 0; d < ndims; ++d)
-        dims[d] = prb_dims[d];
     // iterate over all post ops and prepare md for each binary
     for (int idx = 0; idx < po.len(); ++idx) {
         const auto &e = po.entry[idx];
@@ -961,9 +880,6 @@ int attr_args_t::prepare_post_ops_mds(
             mds.emplace((DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
                                 | po_rhs_tensor_entry.arg_attr_mask),
                     std::move(rhs_tensor_desc));
-        } else if (e.is_convolution_kind()) {
-            // Update dims for post operations appended after conv_dw
-            conv_dw_fusion::get_fused_conv_dst_dims(ndims, e, dims, dims);
         }
     }
 
@@ -990,18 +906,26 @@ dnnl_primitive_attr_t create_dnnl_attr(
             const int arg_name = arg.first;
             if (as.is_def(arg_name)) continue;
 
-            const auto &e = arg.second;
-            // Weights mask differs from primitive to primitive, that's why it
-            // is stashed in `attr_args` at primitive creation time.
-            const bool is_wei_arg = arg_name == DNNL_ARG_WEIGHTS
-                    || arg_name
-                            == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
-            int mask = (is_wei_arg && e.policy != policy_t::COMMON)
-                    ? attr_args.get_mask(arg_name)
-                    : e.policy2mask(arg_name);
+            if (arg_name == DNNL_ARG_WEIGHTS
+                    && arg.second.policy == policy_t::PER_OC
+                    && !attr_args.get(arg_name).is_def()) {
+                const auto &e = attr_args.get(arg_name);
+                // Only RT scales are supported.
+                SAFE_V(e.runtime ? OK : FAIL);
+                int mask = e.mask;
 
-            DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(
-                    dnnl_attr, arg_name, mask));
+                DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(
+                        dnnl_attr, arg_name, mask));
+            } else {
+                const auto &e = arg.second;
+                // Only RT scales are supported.
+                SAFE_V(e.runtime ? OK : FAIL);
+                // Only common policy is supported in the library at this point
+                int mask = attr_t::get_default_mask(e.policy, arg_name);
+
+                DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(
+                        dnnl_attr, arg_name, mask));
+            }
         }
     }
 
@@ -1012,6 +936,10 @@ dnnl_primitive_attr_t create_dnnl_attr(
             if (zp.is_def(arg_name)) continue;
 
             const auto &e = arg.second;
+            // Only RT scales are supported.
+            SAFE_V(e.runtime ? OK : FAIL);
+            // Only common policy/single RT value are supported in the library
+            // at this point
             int mask = attr_t::get_default_mask(e.policy);
 
             DNN_SAFE_V(dnnl_primitive_attr_set_zero_points_mask(
@@ -1037,19 +965,20 @@ dnnl_primitive_attr_t create_dnnl_attr(
                         e.convolution.dst_dt, e.convolution.kernel,
                         e.convolution.stride, e.convolution.padding));
 
-                // TODO: remove in favor of attr-scales option and update input
-                // files relying on scales in dw post-op string.
-                const auto &wei_scale = e.convolution.wei_scale;
-                int wei_mask = wei_scale.policy2mask(DNNL_ARG_WEIGHTS,
-                        dnnl_convolution, /* has_groups = */ true);
-                if (!wei_scale.is_def())
+                const auto &wei_policy = e.convolution.wei_scale.policy;
+                int wei_mask = attr_t::get_default_mask(
+                        wei_policy, DNNL_ARG_WEIGHTS);
+                // dw conv always has group dim
+                if (wei_mask) wei_mask = 1 << wei_mask;
+                if (e.convolution.wei_scale.runtime)
                     DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(dnnl_attr,
                             DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS,
                             wei_mask));
 
-                const auto &dst_scale = e.convolution.dst_scale;
-                int dst_mask = dst_scale.policy2mask(DNNL_ARG_DST);
-                if (!dst_scale.is_def())
+                const auto &dst_policy = e.convolution.dst_scale.policy;
+                int dst_mask
+                        = attr_t::get_default_mask(dst_policy, DNNL_ARG_DST);
+                if (e.convolution.dst_scale.runtime)
                     DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(dnnl_attr,
                             DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST, dst_mask));
 
@@ -1365,14 +1294,15 @@ int check_tag(const std::string &tag_, bool check_enum_tags_only) {
 
 void maybe_scale(const attr_t &attr, float &d, const float *scales, int64_t c,
         int arg, bool opposite_scale) {
-    if (attr.scales.is_def(arg)) return;
+    if (attr.scales.is_def()) return;
 
     const auto &e = attr.scales.get(arg);
     if (!e.is_def()) {
         int64_t idx = e.policy == policy_t::COMMON ? 0 : c;
-        float s = scales[idx];
-        if (opposite_scale) s = 1.f / s;
-        d *= s;
+        if (opposite_scale)
+            d /= scales[idx];
+        else
+            d *= scales[idx];
     }
 }
 
@@ -1537,53 +1467,8 @@ void update_cpu_ref_attrs(attr_t &attr, dnnl_data_type_t new_dt) {
         if (!e.is_binary_kind()) continue;
 
         e.binary.src1_dt = new_dt;
-        e.binary.tag = tag::abx; // Hardcoded in local fill functions.
+        e.binary.tag = tag::abx; // Hardcoded in setup_binary_po as well.
     }
 }
-
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-int sparse_options_t::from_str(const std::string &s) {
-    *this = sparse_options_t();
-    if (s.empty()) return OK;
-
-    const auto get_arg = [](int i) {
-        switch (i) {
-            case 0: return DNNL_ARG_SRC;
-            case 1: return DNNL_ARG_WEIGHTS;
-            case 2: return DNNL_ARG_DST;
-            default: return -1;
-        }
-    };
-
-    int options_count = 0;
-    size_t start_pos = 0;
-    while (start_pos != std::string::npos) {
-        auto subs = parser::get_substr(s, start_pos, ':');
-
-        if (subs.empty()) {
-            add(get_arg(options_count), sparse_options_t::def_encoding,
-                    sparse_options_t::def_sparsity);
-            options_count++;
-            continue;
-        }
-
-        if (subs.find("+") == std::string::npos) {
-            add(get_arg(options_count), str2sparse_encoding(subs.c_str()),
-                    sparse_options_t::def_sparsity);
-        } else {
-            size_t subs_pos = 0;
-            auto encoding_str = parser::get_substr(subs, subs_pos, '+');
-            auto sparsity_str = parser::get_substr(subs, subs_pos, '+');
-            if (encoding_str.empty() || sparsity_str.empty()) { return FAIL; }
-            add(get_arg(options_count),
-                    str2sparse_encoding(encoding_str.c_str()),
-                    atof(sparsity_str.c_str()));
-        }
-        options_count++;
-    }
-    static const int expected_num_options = 3;
-    return options_count == expected_num_options ? OK : FAIL;
-}
-#endif
 
 #undef BENCHDNN_DNNL_ARG_UNDEF

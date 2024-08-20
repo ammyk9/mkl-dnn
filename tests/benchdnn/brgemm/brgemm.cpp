@@ -138,17 +138,30 @@ dnnl_status_t brgemm_attr_init(
 }
 
 std::string prepare_wei_format_string(
-        dnnl_data_type_t dt, int64_t ldb, bool is_vnni_layout) {
+        dnnl_data_type_t dt, int64_t n, bool is_vnni_layout) {
     // `dt` affects the choice of last inner block (for VNNI-friendliness).
     // `n` affects the choice of B block.
     std::string wtag("BA16a");
-    wtag += std::to_string(ldb) + "b";
+    switch (n) {
+        case 64: wtag += "64b"; break;
+        case 48: wtag += "48b"; break;
+        case 32: wtag += "32b"; break;
+        default:
+            if (n <= 16)
+                wtag += "16b";
+            else {
+                if (n % 16 != 0) {
+                    wtag += std::to_string(n) + "b";
+                } else
+                    wtag += std::to_string(16 * div_up(n, 16)) + "b";
+            }
+            break;
+    }
     if (is_vnni_layout) {
         switch (dt) {
             case dnnl_f32: break;
             case dnnl_f16:
             case dnnl_bf16: wtag += "2a"; break;
-            case dnnl_u8:
             case dnnl_s8: wtag += "4a"; break;
             default: assert(!"unsupported data type");
         }
@@ -157,14 +170,15 @@ std::string prepare_wei_format_string(
     return wtag;
 }
 
-int fill_data(data_kind_t kind, const prb_t *prb, const cfg_t &cfg,
-        dnn_mem_t &mem_dt, dnn_mem_t &mem_fp, res_t *res) {
+int fill_data(data_kind_t kind, const prb_t *prb, dnn_mem_t &mem_dt,
+        dnn_mem_t &mem_fp, res_t *res) {
 
     const auto nelems = mem_dt.nelems();
     if (nelems == 0) return OK;
 
     assert(mem_dt.nelems() == mem_fp.nelems());
 
+    cfg_t cfg(prb, {SRC, WEI, BIA, DST});
     cfg_t::density_args_t density_args;
     density_args.data_kind = kind;
     density_args.n_acc = prb->k;
@@ -225,32 +239,31 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     skip_unimplemented_data_type(
             {prb->src_dt(), prb->wei_dt(), prb->bia_dt, prb->dst_dt()},
             prb->dir, res);
-    skip_unimplemented_sum_po(
-            prb->attr, res, dnnl_gemm, prb->src_dt(), prb->dst_dt());
+    skip_unimplemented_sum_po(prb->attr, res, prb->dst_dt());
 }
 
 void skip_invalid_prb(const prb_t *prb, res_t *res) {
+    const bool is_src_zp = !prb->attr.zero_points.is_def(DNNL_ARG_SRC);
+    const bool is_dst_zp = !prb->attr.zero_points.is_def(DNNL_ARG_DST);
+
+    // Only runtime zero points are supported by this driver
+    const bool is_runtime_src_zp = prb->attr.zero_points.runtime(DNNL_ARG_SRC);
+    const bool is_runtime_dst_zp = prb->attr.zero_points.runtime(DNNL_ARG_DST);
+    const bool is_static_zp = (is_src_zp && !is_runtime_src_zp)
+            || (is_dst_zp && !is_runtime_dst_zp);
+    if (is_static_zp) {
+        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        return;
+    }
+
     // AMX kernel only supports SRC zero points in unrolled kernel,
     // and only for values of 0 or 1.
     // Note: this check must be done here due to the fact that zero point value
     // in brgemm API is a runtime argument.
     // TODO: remove once AMX kernel fully supports zero points.
     const bool is_amx = dnnl::mayiuse(dnnl_cpu_isa_avx512_core_amx);
-    const bool is_src_zp = !prb->attr.zero_points.is_def(DNNL_ARG_SRC);
     const int src_zp_value = prb->attr.zero_points.get(DNNL_ARG_SRC).value;
     if (is_amx && is_src_zp && src_zp_value != 0 && src_zp_value != 1) {
-        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
-        return;
-    }
-    // Reorder does not support s8 and zp compensations for arbitrary shapes,
-    // so skip unsupported cases.
-    // Note: this check must be done here to avoid runtime error in benchdnn due
-    // to failed reorder creation.
-    // TODO: enable this support and remove this check.
-    const bool is_bad_ldb = prb->get_ldb() % 16 > 0 || prb->get_ldb() > 64;
-    const bool req_s8_comp = prb->src_dt() == dnnl_s8;
-    const bool req_zp_comp = !prb->attr.zero_points.is_def(DNNL_ARG_SRC);
-    if (is_bad_ldb && (req_s8_comp || req_zp_comp)) {
         res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
         return;
     }
@@ -279,7 +292,7 @@ dnnl_status_t brgemm_kernel_execute_postops_wrapper(
 }
 
 int doit(const prb_t *prb, res_t *res) {
-    if (bench_mode == bench_mode_t::list) return res->state = LISTED, OK;
+    if (bench_mode == LIST) return res->state = LISTED, OK;
 
     skip_start(res);
     if (res->state == SKIPPED) return OK;
@@ -333,10 +346,6 @@ int doit(const prb_t *prb, res_t *res) {
         return res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED, OK;
 
     attr_args_t attr_args;
-    auto wei_scale = prb->attr.scales.get(DNNL_ARG_WEIGHTS);
-    if (wei_scale.policy == policy_t::PER_OC) {
-        attr_args.prepare_scales(prb->attr, DNNL_ARG_WEIGHTS, 2);
-    }
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
             create_dnnl_attr(prb->attr, attr_args));
 
@@ -384,7 +393,7 @@ int doit(const prb_t *prb, res_t *res) {
     // handle from bigger one (where LDB is an actual dim value) to smaller, but
     // there's some reorder bug resulting in an error.
     const auto wtag = prepare_wei_format_string(
-            prb->wei_dt(), prb->get_ldb(), brgemm_desc.is_b_data_layout_vnni());
+            prb->wei_dt(), prb->n, brgemm_desc.is_b_data_layout_vnni());
     BENCHDNN_PRINT(6, "wtag: %s\n", wtag.c_str());
     auto wei_md = dnn_mem_t::init_md(prb->ndims, wei_dims, prb->wei_dt(), wtag);
 
@@ -424,8 +433,6 @@ int doit(const prb_t *prb, res_t *res) {
                 prb->ndims, bia_dims, prb->bia_dt, tag::abx);
     }
 
-    if (bench_mode == bench_mode_t::init) return res->state = INITIALIZED, OK;
-
     const auto &test_engine = get_test_engine();
     const auto &ref_engine = get_cpu_engine();
 
@@ -434,11 +441,8 @@ int doit(const prb_t *prb, res_t *res) {
     dnn_mem_t acc_dt(acc_md, test_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
     dnn_mem_t bia_dt;
-    const char *bia_dt_ptr = nullptr;
-    if (prb->bia_dt != dnnl_data_type_undef) {
+    if (prb->bia_dt != dnnl_data_type_undef)
         bia_dt = dnn_mem_t(bia_md, test_engine);
-        bia_dt_ptr = (const char *)bia_dt;
-    }
 
     dnn_mem_t src_fp(src_md, dnnl_f32, tag::abx, ref_engine);
     dnn_mem_t wei_fp(wei_md, dnnl_f32, tag::abx, ref_engine);
@@ -448,22 +452,30 @@ int doit(const prb_t *prb, res_t *res) {
     if (prb->bia_dt != dnnl_data_type_undef)
         bia_fp = dnn_mem_t(bia_md, dnnl_f32, tag::abx, ref_engine);
 
-    // Move cfg out of filling since its creation is not free.
-    cfg_t cfg(prb, {SRC, WEI, BIA, DST});
-    SAFE(fill_data(SRC, prb, cfg, src_dt, src_fp, res), WARN);
-    SAFE(fill_data(WEI, prb, cfg, wei_dt, wei_fp, res), WARN);
+    SAFE(fill_data(SRC, prb, src_dt, src_fp, res), WARN);
+    SAFE(fill_data(WEI, prb, wei_dt, wei_fp, res), WARN);
     const int sum_idx = prb->attr.post_ops.find(attr_t::post_ops_t::SUM);
     if ((prb->beta != 0) || brgemm_attr.generate_skip_accumulation) {
-        SAFE(fill_data(DST, prb, cfg, acc_dt, acc_fp, res), WARN);
+        SAFE(fill_data(DST, prb, acc_dt, acc_fp, res), WARN);
         // Beta requires same values for reference and the kernel.
         if (use_dst_as_acc) {
             dst_fp.reorder(acc_fp);
             dst_dt.reorder(dst_fp);
         }
     }
-    if (sum_idx >= 0) SAFE(fill_data(DST, prb, cfg, dst_dt, dst_fp, res), WARN);
+    if (sum_idx >= 0) SAFE(fill_data(DST, prb, dst_dt, dst_fp, res), WARN);
     if (prb->bia_dt != dnnl_data_type_undef)
-        SAFE(fill_data(BIA, prb, cfg, bia_dt, bia_fp, res), WARN);
+        SAFE(fill_data(BIA, prb, bia_dt, bia_fp, res), WARN);
+
+    dnn_mem_t src_zero_points_m, wei_zero_points_m, dst_zero_points_m;
+    const auto &wei_zero_point_val
+            = prb->attr.zero_points.get(DNNL_ARG_WEIGHTS).value;
+    maybe_prepare_runtime_zero_points(
+            src_zero_points_m, prb->attr, DNNL_ARG_SRC, prb->k, prb->src_zp);
+    maybe_prepare_runtime_zero_points(wei_zero_points_m, prb->attr,
+            DNNL_ARG_WEIGHTS, 1, &(wei_zero_point_val));
+    maybe_prepare_runtime_zero_points(
+            dst_zero_points_m, prb->attr, DNNL_ARG_DST, prb->n, prb->dst_zp);
 
     // "Library" args are needed to get dst for comparison.
     // "Reference" are used as usual.
@@ -486,7 +498,6 @@ int doit(const prb_t *prb, res_t *res) {
         case dnnl_f32: block_size = 16; break;
         case dnnl_f16: block_size = 16; break;
         case dnnl_bf16: block_size = 32; break;
-        case dnnl_u8:
         case dnnl_s8: block_size = 64; break;
         default: break;
     }
@@ -509,14 +520,11 @@ int doit(const prb_t *prb, res_t *res) {
     // Brgemm takes single pointer oscale, but relies on a combination of arg
     // scales attributes. This helps to reuse attributes from primitives, but
     // requires them to pre-compute oscale = src_scale * wei_scale[:]
+    dnn_mem_t scales;
     auto src_scale = prb->attr.scales.get(DNNL_ARG_SRC);
-    auto attr_scale = !wei_scale.is_def() ? wei_scale : src_scale;
-
-    const int64_t count = attr_scale.policy == policy_t::COMMON ? 1 : prb->n;
-    dnn_mem_t scales(1, &count, dnnl_f32, tag::x, get_test_engine());
-    for (int64_t c = 0; c < count; ++c)
-        scales.set_elem(c, prb->scales[c]);
-
+    auto wei_scale = prb->attr.scales.get(DNNL_ARG_WEIGHTS);
+    auto attr_scale = wei_scale.runtime ? wei_scale : src_scale;
+    maybe_prepare_runtime_scales(scales, attr_scale, prb->n, prb->scales);
     // Handle output scale common policy separately since the implementation
     // always expects them to be of vector length in case of `common` policy.
     std::vector<float> v16_scales(16, prb->scales[0]);
@@ -539,10 +547,11 @@ int doit(const prb_t *prb, res_t *res) {
 
     char *acc_ptr = (char *)acc_dt;
 
-    const int32_t *dst_zp_ptr = (const int32_t *)prb->dst_zp;
+    const int32_t *dst_zp_ptr = (const int32_t *)dst_zero_points_m;
     char *src_comp_ptr = (char *)wei_dt + wei_offset_zp;
-    int32_t zp_a_val
-            = !prb->attr.zero_points.is_def(DNNL_ARG_SRC) ? prb->src_zp[0] : 0;
+    int32_t zp_a_val = !prb->attr.zero_points.is_def(DNNL_ARG_SRC)
+            ? src_zero_points_m.get_elem(0)
+            : 0;
 
     if (!prb->attr.zero_points.is_def(DNNL_ARG_WEIGHTS)) {
         // TODO: weights zero point is not supported yet.
@@ -558,7 +567,7 @@ int doit(const prb_t *prb, res_t *res) {
     }
 
     brgemm_post_ops_data_t post_ops_data(
-            /* bias */ bia_dt_ptr,
+            /* bias */ (const char *)bia_dt,
             /* scales */ scales_ptr, /* binary_post_ops_rhs */ nullptr,
             /* oc_logical_off */ 0, /* dst_row_logical_off */ 0,
             /* data_C_ptr_ */ acc_ptr, /* first_mb_matrix_addr_off */ 0,
@@ -589,7 +598,7 @@ int doit(const prb_t *prb, res_t *res) {
             scratchpad_ptr);
     if (res) res->state = EXECUTED;
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
+    if (is_bench_mode(CORR)) {
         ref_args.set(DNNL_ARG_SRC, src_fp);
         ref_args.set(DNNL_ARG_WEIGHTS, wei_fp);
         if (prb->bia_dt != dnnl_data_type_undef)
@@ -600,7 +609,6 @@ int doit(const prb_t *prb, res_t *res) {
         // A hack to pass brgemm attributes to reference since some members
         // change the computation flow for correctness validation.
         dnn_mem_t workspace(src_md, ref_engine, {false, (void *)&brgemm_attr});
-        workspace.map();
         ref_args.set(DNNL_ARG_WORKSPACE, workspace);
 
         check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);

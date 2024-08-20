@@ -27,6 +27,7 @@ namespace x64 {
 
 struct jit_brgemm_primitive_conf_t {
     prop_kind_t prop_kind;
+    conv_loop_order_t loop_order;
     conv_harness_t harness;
     int simd_w;
     int ndims;
@@ -45,7 +46,7 @@ struct jit_brgemm_primitive_conf_t {
     bool with_eltwise;
     bool with_binary;
     bool with_scales;
-    bool req_s8s8_compensation;
+    bool signed_input;
     int nb_ic, ic_block, ic_block_ext;
     int nb_oc, oc_block, oc_block_ext;
     int nb_iw, iw_block;
@@ -77,11 +78,13 @@ struct jit_brgemm_primitive_conf_t {
     int nthr, nthr_mb, nthr_oc_b, nthr_ic_b;
 
     cpu_isa_t isa;
+    bool ip_bwd_d_global_b_transpose;
     bool use_uker;
     bool use_interleave_stores;
     int amx_buf_size_per_thread;
     brgemm_kernel_prefetching_t hint_prefetching
             = brgemm_kernel_prefetching_t::brgemm_prf_default;
+    bool ip_bwd_w_local_buffers_for_input_tensors;
     bool with_dst_scales;
 };
 
